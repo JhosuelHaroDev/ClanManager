@@ -21,11 +21,12 @@ export interface Miembro {
   liga_base: string | null
 }
 
+/**
+ * Lista de miembros en vivo, sin niveles de héroe. La pantalla de
+ * miembros ya no la usa para la tabla, porque api/capturas.ts trae todo
+ * lo mismo más los héroes, pero queda disponible por si otra pantalla
+ * necesita el estado más reciente sin pasar por una captura guardada.
+ */
 export function obtenerMiembros(): Promise<Miembro[]> {
   return solicitar<Miembro[]>('/api/miembros')
-}
-
-/** Dispara una captura manual: consulta el clan en vivo y la guarda en el historial. */
-export function dispararCaptura(): Promise<unknown> {
-  return solicitar('/api/capturas', { method: 'POST' })
 }
