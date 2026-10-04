@@ -2,7 +2,8 @@ import { NavLink, Outlet } from 'react-router-dom'
 
 const enlaces = [
   { ruta: '/', etiqueta: 'Miembros' },
-  // Los enlaces de guerra, liga y asaltos se agregan junto con cada pantalla.
+  { ruta: '/guerra', etiqueta: 'Guerra' },
+  // Los enlaces de liga y asaltos se agregan junto con cada pantalla.
 ]
 
 /**

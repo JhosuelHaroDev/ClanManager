@@ -1,5 +1,6 @@
 import { Route, Routes } from 'react-router-dom'
 import { DisenoPrincipal } from './componentes/DisenoPrincipal'
+import { PaginaGuerra } from './paginas/PaginaGuerra'
 import { PaginaMiembros } from './paginas/PaginaMiembros'
 
 function App() {
@@ -7,7 +8,8 @@ function App() {
     <Routes>
       <Route element={<DisenoPrincipal />}>
         <Route path="/" element={<PaginaMiembros />} />
-        {/* Las rutas de guerra, liga y asaltos se agregan junto con cada pantalla. */}
+        <Route path="/guerra" element={<PaginaGuerra />} />
+        {/* Las rutas de liga y asaltos se agregan junto con cada pantalla. */}
       </Route>
     </Routes>
   )
