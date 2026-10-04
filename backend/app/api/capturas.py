@@ -24,6 +24,22 @@ async def listar_capturas(
     capturas = await servicio_capturas.listar_capturas(sesion, limite)
     return [CapturaOut.model_validate(c) for c in capturas]
 
+@router.get("/ultima")
+async def obtener_ultima_captura(sesion: SesionBD) -> CapturaDetalleOut:
+    """
+    Devuelve la captura guardada más reciente, con el detalle completo de
+    sus miembros.
+
+    Declarada antes que /{captura_id}: FastAPI prueba las rutas en el
+    orden en que se registran, y como "ultima" también podría leerse como
+    el valor de captura_id, si esta ruta fuera la última, nunca se
+    alcanzaría, porque la otra la interceptaría primero y fallaría con
+    422 al no poder convertir "ultima" en un número.
+    """
+    captura = await servicio_capturas.obtener_ultima_captura(sesion)
+    if captura is None:
+        raise HTTPException(status_code=404, detail="Todavía no hay ninguna captura guardada")
+    return CapturaDetalleOut.model_validate(captura)
 
 @router.get("/{captura_id}")
 async def obtener_captura(captura_id: int, sesion: SesionBD) -> CapturaDetalleOut:

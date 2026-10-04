@@ -8,28 +8,55 @@ from sqlalchemy.orm import selectinload
 
 from app.models.captura import Captura, CapturaMiembro
 from app.schemas.miembro import MiembroOut
-from app.services.clash_client import ClashClient, normalizar_tag
+from app.services.clash_client import ClashApiError, ClashClient, normalizar_tag
 
 
 async def crear_captura(sesion: AsyncSession, cliente: ClashClient) -> Captura:
-    """Consulta el estado actual del clan y lo guarda como una nueva captura."""
+    """
+    Consulta el estado actual del clan y lo guarda como una nueva captura.
+
+    Los niveles de héroe no vienen en la lista de miembros del clan, así
+    que por cada miembro se hace además una consulta aparte a su perfil
+    individual. Esto multiplica las llamadas a la API por el tamaño del
+    clan, a propósito solo dentro de nuestra propia cadencia programada,
+    no en cada visita a la página.
+    """
     clan = await cliente.obtener_clan()
+
+    miembros = []
+    for datos in clan["memberList"]:
+        miembro = MiembroOut.desde_api(datos)
+        try:
+            jugador = await cliente.obtener_jugador(miembro.tag)
+            miembro = miembro.con_heroes(jugador)
+        except ClashApiError:
+            # Si el perfil de un jugador puntual falla, se guarda la
+            # captura igual, sin sus héroes, en vez de perder todo lo demás.
+            pass
+        miembros.append(CapturaMiembro(**miembro.model_dump()))
 
     captura = Captura(
         tag_clan=clan["tag"],
         nombre_clan=clan["name"],
         nivel_clan=clan["clanLevel"],
         total_miembros=clan["members"],
-        miembros=[
-            CapturaMiembro(**MiembroOut.desde_api(datos).model_dump())
-            for datos in clan["memberList"]
-        ],
+        miembros=miembros,
     )
 
     sesion.add(captura)
     await sesion.commit()
     return captura
 
+
+async def obtener_ultima_captura(sesion: AsyncSession) -> Captura | None:
+    """Devuelve la captura más reciente, con sus miembros ya cargados, o None si no hay ninguna."""
+    resultado = await sesion.execute(
+        select(Captura)
+        .order_by(Captura.capturado_en.desc())
+        .limit(1)
+        .options(selectinload(Captura.miembros))
+    )
+    return resultado.scalar_one_or_none()
 
 async def listar_capturas(sesion: AsyncSession, limite: int) -> list[Captura]:
     """Devuelve las capturas más recientes, de la más nueva a la más antigua."""

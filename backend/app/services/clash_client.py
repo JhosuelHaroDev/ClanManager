@@ -101,6 +101,16 @@ class ClashClient:
         )
         return datos.get("items", [])
 
+    async def obtener_jugador(self, tag: str) -> dict:
+        """
+        Detalle completo de un jugador, incluidos sus héroes de la aldea
+        principal.
+
+        Es el único lugar de la API donde aparece el nivel de cada héroe;
+        la lista de miembros del clan no lo trae.
+        """
+        return await self._get(f"/players/{quote(normalizar_tag(tag))}")
+
     async def obtener_grupo_liga_guerras(self) -> dict:
         """
         Grupo de la Liga de Guerras de Clanes (CWL) actual.

@@ -66,6 +66,16 @@ class CapturaMiembro(Base):
     trofeos_base: Mapped[int | None]
     liga_base: Mapped[str | None] = mapped_column(String(50))
 
+    # Niveles de héroe de la aldea principal. Nulos si el héroe todavía no
+    # está desbloqueado a ese ayuntamiento, o en capturas guardadas antes
+    # de que empezáramos a leer estos datos.
+    nivel_rey_barbaro: Mapped[int | None]
+    nivel_reina_arquera: Mapped[int | None]
+    nivel_gran_centinela: Mapped[int | None]
+    nivel_principe_esbirro: Mapped[int | None]
+    nivel_luchadora_real: Mapped[int | None]
+    nivel_duque_dragon: Mapped[int | None]
+
     captura: Mapped["Captura"] = relationship(back_populates="miembros")
 
     @property
