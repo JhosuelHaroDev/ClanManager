@@ -21,6 +21,16 @@ async def guerra_actual(cliente: ClienteClash) -> GuerraActualOut:
     datos = await cliente.obtener_guerra_actual()
     return GuerraActualOut.desde_api(datos)
 
+@router.post("/actual")
+async def sondear_guerra_actual(cliente: ClienteClash, sesion: SesionBD) -> dict:
+    """
+    Dispara manualmente un sondeo de la guerra actual: la consulta a
+    Supercell y la guarda o actualiza en el historial, igual que hace el
+    programador automático. Pensado para el botón de refresco manual del
+    frontend.
+    """
+    guerra = await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+    return {"guardada": guerra is not None}
 
 @router.get("/registro")
 async def registro_guerras(
