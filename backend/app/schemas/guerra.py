@@ -147,8 +147,14 @@ class GuerraActualOut(BaseModel):
             preparacion_inicio=_parsear_fecha_coc(datos.get("preparationStartTime")),
             inicio=_parsear_fecha_coc(datos.get("startTime")),
             fin=_parsear_fecha_coc(datos.get("endTime")),
-            clan=BandoGuerraOut._desde_api(clan_datos, nombres) if clan_datos else None,
-            rival=BandoGuerraOut._desde_api(rival_datos, nombres) if rival_datos else None,
+            # Cuando el clan no está en guerra, Supercell no omite las
+            # claves "clan" y "opponent": las manda como objetos casi
+            # vacíos, con badgeUrls y ceros, pero sin "tag". Por eso no
+            # basta con comprobar que la clave exista; hay que comprobar
+            # que de verdad traiga un tag antes de intentar construir el
+            # bando completo.
+            clan=BandoGuerraOut._desde_api(clan_datos, nombres) if clan_datos and clan_datos.get("tag") else None,
+            rival=BandoGuerraOut._desde_api(rival_datos, nombres) if rival_datos and rival_datos.get("tag") else None,
         )
 
 
