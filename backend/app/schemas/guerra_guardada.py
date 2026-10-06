@@ -53,10 +53,15 @@ class GuerraResumenOut(BaseModel):
     war_tag: str | None
     liga_temporada: str | None
     liga_ronda: int | None
-    rival_nombre: str
+    tamano_equipo: int | None
+    ataques_por_miembro: int | None
+    clan_nivel: int
     clan_estrellas: int
-    rival_estrellas: int
     clan_destruccion: float
+    clan_ataques_usados: int | None
+    rival_nombre: str
+    rival_nivel: int
+    rival_estrellas: int
     rival_destruccion: float
     inicio: datetime | None
     fin: datetime | None
@@ -64,21 +69,22 @@ class GuerraResumenOut(BaseModel):
 
 
 class GuerraDetalleOut(GuerraResumenOut):
-    """Una guerra guardada, con el detalle completo de miembros y ataques."""
+    """
+    Una guerra guardada, con el detalle completo de miembros y ataques.
 
-    tamano_equipo: int | None
-    ataques_por_miembro: int | None
+    Hereda de GuerraResumenOut los campos básicos, incluidos el tamaño del
+    equipo, los niveles de clan y los ataques usados; aquí solo se agrega
+    lo que únicamente tiene sentido en la vista de detalle.
+    """
+
     modificador_batalla: str | None
     preparacion_inicio: datetime
 
     clan_tag: str
     clan_nombre: str
-    clan_nivel: int
-    clan_ataques_usados: int | None
     clan_experiencia_ganada: int | None
 
     rival_tag: str
-    rival_nivel: int
 
     miembros: list[MiembroGuerraGuardadoOut]
     ataques: list[AtaqueGuerraGuardadoOut]

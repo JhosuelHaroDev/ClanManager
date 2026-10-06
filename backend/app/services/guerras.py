@@ -192,9 +192,20 @@ def _agregar_miembros_y_ataques(guerra: Guerra, bando: BandoGuerraOut, *, es_pro
 
 
 async def listar_guerras(sesion: AsyncSession, limite: int) -> list[Guerra]:
-    """Devuelve las guerras guardadas, de la más reciente a la más antigua."""
+    """
+    Devuelve las guerras clásicas guardadas, de la más reciente a la más
+    antigua.
+
+    Excluye las rondas de CWL a propósito: war_tag IS NULL es justo lo
+    que distingue a una guerra clásica de una de liga en esta tabla. Las
+    rondas de CWL se listan aparte, agrupadas por temporada y ronda, no
+    mezcladas en este historial.
+    """
     resultado = await sesion.execute(
-        select(Guerra).order_by(Guerra.preparacion_inicio.desc()).limit(limite)
+        select(Guerra)
+        .where(Guerra.war_tag.is_(None))
+        .order_by(Guerra.preparacion_inicio.desc())
+        .limit(limite)
     )
     return list(resultado.scalars().all())
 
