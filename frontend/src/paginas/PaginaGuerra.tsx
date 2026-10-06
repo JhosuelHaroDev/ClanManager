@@ -30,6 +30,44 @@ function formatearFecha(fecha: string | null): string {
   return new Date(fecha).toLocaleString('es-PE', { dateStyle: 'medium', timeStyle: 'short' })
 }
 
+/** Dos decimales fijos para los porcentajes de destrucción, que la API entrega con muchos más. */
+function formatearPorcentaje(valor: number): string {
+  return `${valor.toFixed(2)}%`
+}
+
+type Resultado = 'victoria' | 'derrota' | 'empate' | 'en_curso'
+
+const ETIQUETA_RESULTADO: Record<Resultado, string> = {
+  victoria: 'Victoria',
+  derrota: 'Derrota',
+  empate: 'Empate',
+  en_curso: 'En curso',
+}
+
+const COLOR_RESULTADO: Record<Resultado, string> = {
+  victoria: '#16A34A',
+  derrota: '#DC2626',
+  empate: '#6B7280',
+  en_curso: '#2B7FAE',
+}
+
+/**
+ * Resultado de una guerra guardada, siguiendo el mismo criterio de
+ * desempate que usa el juego: primero estrellas, y si están empatadas,
+ * el porcentaje de destrucción. Antes de que la guerra termine, el
+ * resultado todavía no es definitivo, así que se marca aparte.
+ */
+function resultadoDe(g: GuerraResumen): Resultado {
+  if (g.estado !== 'warEnded') return 'en_curso'
+  if (g.clan_estrellas !== g.rival_estrellas) {
+    return g.clan_estrellas > g.rival_estrellas ? 'victoria' : 'derrota'
+  }
+  if (g.clan_destruccion !== g.rival_destruccion) {
+    return g.clan_destruccion > g.rival_destruccion ? 'victoria' : 'derrota'
+  }
+  return 'empate'
+}
+
 export function PaginaGuerra() {
   const [guerra, setGuerra] = useState<GuerraActual | null>(null)
   const [historial, setHistorial] = useState<GuerraResumen[]>([])
@@ -128,11 +166,11 @@ export function PaginaGuerra() {
                           {'⭐'.repeat(estrellasDe(miembro)) || '—'}
                         </td>
                         <td className="px-3 py-2">
-                          {miembro.ataques_realizados.length ? `${mejorDestruccionDe(miembro)}%` : '—'}
+                          {miembro.ataques_realizados.length ? formatearPorcentaje(mejorDestruccionDe(miembro)) : '—'}
                         </td>
                         <td className="px-3 py-2">
                           {miembro.mejor_ataque_recibido
-                            ? `${miembro.mejor_ataque_recibido.atacante_nombre ?? miembro.mejor_ataque_recibido.atacante_tag} · ${miembro.mejor_ataque_recibido.estrellas}⭐ (${miembro.mejor_ataque_recibido.destruccion}%)`
+                            ? `${miembro.mejor_ataque_recibido.atacante_nombre ?? miembro.mejor_ataque_recibido.atacante_tag} · ${miembro.mejor_ataque_recibido.estrellas}⭐ (${formatearPorcentaje(miembro.mejor_ataque_recibido.destruccion)})`
                             : '—'}
                         </td>
                       </tr>
@@ -147,35 +185,54 @@ export function PaginaGuerra() {
 
       {!cargando && !error && (
         <div>
-          <h3 className="mb-2 font-display text-lg font-bold text-guerra-texto">Guerras anteriores</h3>
+          <h3 className="mb-2 font-display text-lg font-bold text-guerra-texto">Guerras clásicas anteriores</h3>
           <div className="overflow-x-auto rounded-xl border-2 border-guerra-borde bg-guerra-panel">
             <table className="w-full text-left">
               <thead className="font-display">
                 <tr className="border-b-2 border-guerra-borde">
+                  <th className="px-3 py-2">Resultado</th>
                   <th className="px-3 py-2">Rival</th>
+                  <th className="px-3 py-2">Nivel rival</th>
                   <th className="px-3 py-2">Marcador</th>
+                  <th className="px-3 py-2">Equipos</th>
+                  <th className="px-3 py-2">Ataques usados</th>
+                  <th className="px-3 py-2">Inicio</th>
                   <th className="px-3 py-2">Terminó</th>
-                  <th className="px-3 py-2">CWL</th>
                 </tr>
               </thead>
               <tbody>
                 {historial.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="px-3 py-3 text-center text-guerra-texto/60">
-                      Todavía no hay guerras guardadas.
+                    <td colSpan={8} className="px-3 py-3 text-center text-guerra-texto/60">
+                      Todavía no hay guerras clásicas guardadas.
                     </td>
                   </tr>
                 )}
-                {historial.map((g) => (
-                  <tr key={g.id} className="border-t border-guerra-borde/60 hover:bg-guerra-fondo/60">
-                    <td className="px-3 py-2">{g.rival_nombre}</td>
-                    <td className="px-3 py-2">
-                      {g.clan_estrellas}⭐ ({g.clan_destruccion}%) — {g.rival_estrellas}⭐ ({g.rival_destruccion}%)
-                    </td>
-                    <td className="px-3 py-2">{formatearFecha(g.fin)}</td>
-                    <td className="px-3 py-2">{g.liga_ronda ? `Ronda ${g.liga_ronda}` : '—'}</td>
-                  </tr>
-                ))}
+                {historial.map((g) => {
+                  const resultado = resultadoDe(g)
+                  return (
+                    <tr key={g.id} className="border-t border-guerra-borde/60 transition-colors hover:bg-guerra-fondo/60">
+                      <td className="px-3 py-2 font-display font-bold" style={{ color: COLOR_RESULTADO[resultado] }}>
+                        {ETIQUETA_RESULTADO[resultado].toUpperCase()}
+                      </td>
+                      <td className="px-3 py-2 font-semibold">{g.rival_nombre}</td>
+                      <td className="px-3 py-2">{g.rival_nivel}</td>
+                      <td className="px-3 py-2">
+                        {g.clan_estrellas}⭐ ({formatearPorcentaje(g.clan_destruccion)}) — {g.rival_estrellas}⭐ (
+                        {formatearPorcentaje(g.rival_destruccion)})
+                      </td>
+                      <td className="px-3 py-2">{g.tamano_equipo ? `${g.tamano_equipo} vs ${g.tamano_equipo}` : '—'}</td>
+                      <td className="px-3 py-2">
+                        {g.clan_ataques_usados ?? '—'}
+                        {g.clan_ataques_usados !== null && g.tamano_equipo && g.ataques_por_miembro
+                          ? ` / ${g.tamano_equipo * g.ataques_por_miembro}`
+                          : ''}
+                      </td>
+                      <td className="px-3 py-2">{formatearFecha(g.inicio)}</td>
+                      <td className="px-3 py-2">{formatearFecha(g.fin)}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -203,7 +260,7 @@ function ResumenBando({
         {bando.nombre} <span className="text-sm font-normal">(nivel {bando.nivel_clan})</span>
       </p>
       <p className="text-guerra-acento">
-        {bando.estrellas}⭐ · {bando.destruccion}% de destrucción
+        {bando.estrellas}⭐ · {formatearPorcentaje(bando.destruccion)} de destrucción
       </p>
       {bando.ataques_usados !== null && <p className="text-sm">{bando.ataques_usados} ataques usados</p>}
     </div>

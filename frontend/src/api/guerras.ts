@@ -60,10 +60,15 @@ export interface GuerraResumen {
   war_tag: string | null
   liga_temporada: string | null
   liga_ronda: number | null
-  rival_nombre: string
+  tamano_equipo: number | null
+  ataques_por_miembro: number | null
+  clan_nivel: number
   clan_estrellas: number
-  rival_estrellas: number
   clan_destruccion: number
+  clan_ataques_usados: number | null
+  rival_nombre: string
+  rival_nivel: number
+  rival_estrellas: number
   rival_destruccion: number
   inicio: string | null
   fin: string | null
