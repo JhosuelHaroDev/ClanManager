@@ -47,7 +47,15 @@ async def guardar_liga_actual(sesion: AsyncSession, cliente: ClashClient) -> lis
     veces no hace falta volver a buscarlo.
     """
     grupo = await cliente.obtener_grupo_liga_guerras()
-    temporada = grupo["season"]
+
+    # Fuera de una CWL, Supercell puede responder con un error 404, que
+    # sube como ClashApiError, o con una respuesta sin temporada. Como
+    # con notInWar en las guerras clásicas, no se asume que los campos
+    # existan: sin temporada no hay liga que guardar.
+    temporada = grupo.get("season")
+    if not temporada:
+        return []
+
     nuestro_tag = normalizar_tag(settings.clan_tag)
 
     guardadas: list[Guerra] = []
