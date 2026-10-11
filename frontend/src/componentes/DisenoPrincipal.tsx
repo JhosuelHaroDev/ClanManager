@@ -3,6 +3,7 @@ import { NavLink, Outlet } from 'react-router-dom'
 const enlaces = [
   { ruta: '/', etiqueta: 'Miembros' },
   { ruta: '/guerra', etiqueta: 'Guerra' },
+  { ruta: '/liga', etiqueta: 'Liga' },
   // Los enlaces de liga y asaltos se agregan junto con cada pantalla.
 ]
 

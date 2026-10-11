@@ -9,6 +9,8 @@ import {
 } from '../api/guerras'
 import { ErrorApi } from '../api/cliente'
 import { BotonRefresco } from '../componentes/BotonRefresco'
+import { formatearFecha, formatearPorcentaje } from '../utilidades/formato'
+import { COLOR_RESULTADO, ETIQUETA_RESULTADO, resultadoDe } from '../utilidades/resultadoGuerra'
 
 const ETIQUETA_ESTADO: Record<string, string> = {
   notInWar: 'Sin guerra activa',
@@ -23,49 +25,6 @@ function estrellasDe(miembro: MiembroGuerra): number {
 
 function mejorDestruccionDe(miembro: MiembroGuerra): number {
   return miembro.ataques_realizados.reduce((max, ataque) => Math.max(max, ataque.destruccion), 0)
-}
-
-function formatearFecha(fecha: string | null): string {
-  if (!fecha) return '—'
-  return new Date(fecha).toLocaleString('es-PE', { dateStyle: 'medium', timeStyle: 'short' })
-}
-
-/** Dos decimales fijos para los porcentajes de destrucción, que la API entrega con muchos más. */
-function formatearPorcentaje(valor: number): string {
-  return `${valor.toFixed(2)}%`
-}
-
-type Resultado = 'victoria' | 'derrota' | 'empate' | 'en_curso'
-
-const ETIQUETA_RESULTADO: Record<Resultado, string> = {
-  victoria: 'Victoria',
-  derrota: 'Derrota',
-  empate: 'Empate',
-  en_curso: 'En curso',
-}
-
-const COLOR_RESULTADO: Record<Resultado, string> = {
-  victoria: '#16A34A',
-  derrota: '#DC2626',
-  empate: '#6B7280',
-  en_curso: '#2B7FAE',
-}
-
-/**
- * Resultado de una guerra guardada, siguiendo el mismo criterio de
- * desempate que usa el juego: primero estrellas, y si están empatadas,
- * el porcentaje de destrucción. Antes de que la guerra termine, el
- * resultado todavía no es definitivo, así que se marca aparte.
- */
-function resultadoDe(g: GuerraResumen): Resultado {
-  if (g.estado !== 'warEnded') return 'en_curso'
-  if (g.clan_estrellas !== g.rival_estrellas) {
-    return g.clan_estrellas > g.rival_estrellas ? 'victoria' : 'derrota'
-  }
-  if (g.clan_destruccion !== g.rival_destruccion) {
-    return g.clan_destruccion > g.rival_destruccion ? 'victoria' : 'derrota'
-  }
-  return 'empate'
 }
 
 export function PaginaGuerra() {
