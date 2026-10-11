@@ -146,12 +146,12 @@ async def capturar_liga_una_vez(cliente: ClashClient) -> None:
     """
     async with FabricaSesion() as sesion:
         try:
-            guardadas = await servicio_guerras.guardar_liga_actual(sesion, cliente)
+            resultado = await servicio_guerras.guardar_liga_actual(sesion, cliente)
         except ClashApiError as error:
             logger.debug("Sin Liga de Guerras de Clanes activa o falló el sondeo: %s", error)
             return
 
-    for guerra in guardadas:
+    for guerra in resultado.guerras_propias:
         logger.info(
             "Guerra de CWL actualizada: ronda=%s id=%s estado=%s rival=%s estrellas=%s/%s",
             guerra.liga_ronda, guerra.id, guerra.estado, guerra.rival_nombre,

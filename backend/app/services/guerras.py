@@ -1,4 +1,5 @@
 """Servicio para guardar y actualizar el registro de guerras, clásicas y de la Liga de Guerras de Clanes."""
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,9 +7,10 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.models.guerra import Guerra, GuerraAtaque, GuerraMiembro
+from app.models.liga import LigaEnfrentamiento
 from app.schemas.guerra import BandoGuerraOut, GuerraActualOut
-from app.services.clash_client import ClashClient, normalizar_tag
-
+from app.services.clash_client import ClashApiError, ClashClient, normalizar_tag
+from app.services.liga import guardar_enfrentamiento
 
 async def guardar_guerra_actual(sesion: AsyncSession, cliente: ClashClient) -> Guerra | None:
     """
@@ -33,18 +35,26 @@ async def guardar_guerra_actual(sesion: AsyncSession, cliente: ClashClient) -> G
         datos_extra={},
     )
 
+@dataclass
+class ResultadoSondeoLiga:
+    """Qué hizo un sondeo de la liga, para que quien lo pidió pueda informarlo."""
 
-async def guardar_liga_actual(sesion: AsyncSession, cliente: ClashClient) -> list[Guerra]:
+    en_liga: bool
+    guerras_propias: list[Guerra]
+    enfrentamientos_consultados: int
+
+
+async def guardar_liga_actual(sesion: AsyncSession, cliente: ClashClient) -> ResultadoSondeoLiga:
     """
-    Sondea el grupo de la Liga de Guerras de Clanes (CWL) actual y guarda o
-    actualiza la guerra de nuestro clan en cada ronda ya disponible.
+    Sondea el grupo de la Liga de Guerras de Clanes (CWL) actual y guarda
+    todas las guerras de cada ronda ya disponible.
 
-    Para cada ronda, si ya sabemos cuál de sus war tags es el nuestro, lo
-    consulta directamente. Si no, recorre los war tags de esa ronda hasta
-    encontrar el que involucra a nuestro clan, ignorando el marcador "#0"
-    que Supercell usa para rondas todavía no reveladas. Una vez encontrado,
-    ese war tag queda guardado junto con la guerra, así que las siguientes
-    veces no hace falta volver a buscarlo.
+    De cada guerra del grupo, sea de nuestro clan o no, se guarda el
+    resumen en LigaEnfrentamiento, que alimenta la clasificación y la
+    vista de rondas. De las de nuestro clan, además, se guarda el detalle
+    completo en Guerra. Las guerras ya terminadas no se vuelven a pedir a
+    Supercell: su resultado ya no cambia. Los marcadores "#0" son rondas
+    que Supercell todavía no reveló.
     """
     grupo = await cliente.obtener_grupo_liga_guerras()
 
@@ -54,44 +64,83 @@ async def guardar_liga_actual(sesion: AsyncSession, cliente: ClashClient) -> lis
     # existan: sin temporada no hay liga que guardar.
     temporada = grupo.get("season")
     if not temporada:
-        return []
+        return ResultadoSondeoLiga(en_liga=False, guerras_propias=[], enfrentamientos_consultados=0)
 
     nuestro_tag = normalizar_tag(settings.clan_tag)
-
-    guardadas: list[Guerra] = []
+    propias: list[Guerra] = []
+    consultados = 0
 
     for numero_ronda, ronda in enumerate(grupo.get("rounds", []), start=1):
-        war_tag_conocido = await war_tag_de_ronda(sesion, temporada, numero_ronda)
-
-        if war_tag_conocido is not None:
-            datos = await cliente.obtener_guerra_liga(war_tag_conocido)
-            guerra = await _persistir_guerra_liga(sesion, datos, war_tag_conocido, temporada, numero_ronda)
-            if guerra is not None:
-                guardadas.append(guerra)
-            continue
-
         for war_tag in ronda.get("warTags", []):
             if war_tag == "#0":
                 continue  # Ronda todavía no revelada por Supercell.
+            if await _ya_es_definitiva(sesion, war_tag, nuestro_tag):
+                continue
 
-            datos = await cliente.obtener_guerra_liga(war_tag)
+            try:
+                datos = await cliente.obtener_guerra_liga(war_tag)
+            except ClashApiError as error:
+                if error.status_code == 404:
+                    continue  # Esa guerra todavía no existe; se reintenta en el próximo sondeo.
+                raise
+            consultados += 1
+
+            await guardar_enfrentamiento(sesion, datos, war_tag, temporada, numero_ronda)
+
             tags_involucrados = {datos.get("clan", {}).get("tag"), datos.get("opponent", {}).get("tag")}
-            if nuestro_tag not in tags_involucrados:
-                continue  # Es la guerra de otro emparejamiento de esta ronda, no la nuestra.
+            if nuestro_tag in tags_involucrados:
+                guerra = await _persistir_guerra_liga(sesion, datos, war_tag, temporada, numero_ronda)
+                if guerra is not None:
+                    propias.append(guerra)
 
-            guerra = await _persistir_guerra_liga(sesion, datos, war_tag, temporada, numero_ronda)
-            if guerra is not None:
-                guardadas.append(guerra)
-            break  # Ya encontramos la guerra de esta ronda; no seguir revisando el resto.
+    await sesion.commit()
+    return ResultadoSondeoLiga(en_liga=True, guerras_propias=propias, enfrentamientos_consultados=consultados)
 
-    return guardadas
 
+async def _ya_es_definitiva(sesion: AsyncSession, war_tag: str, nuestro_tag: str) -> bool:
+    """
+    Indica si una guerra del grupo ya terminó y está bien guardada, de modo
+    que no hace falta volver a pedirla a Supercell.
+
+    Si es una guerra de nuestro clan, además de haber terminado, debe
+    tener guardado su detalle con nuestro clan del lado correcto. Esa
+    segunda condición es lo que permite que guerras guardadas con los
+    lados invertidos, por un error anterior, se vuelvan a pedir una vez
+    y queden corregidas.
+    """
+    resultado = await sesion.execute(
+        select(LigaEnfrentamiento).where(LigaEnfrentamiento.war_tag == war_tag)
+    )
+    enfrentamiento = resultado.scalar_one_or_none()
+    if enfrentamiento is None or enfrentamiento.estado != "warEnded":
+        return False
+    if nuestro_tag not in (enfrentamiento.clan_a_tag, enfrentamiento.clan_b_tag):
+        return True
+
+    resultado = await sesion.execute(select(Guerra).where(Guerra.war_tag == war_tag))
+    guerra = resultado.scalar_one_or_none()
+    return guerra is not None and guerra.clan_tag == nuestro_tag and guerra.estado == "warEnded"
+
+
+def _orientar_hacia_nuestro_clan(datos: dict, nuestro_tag: str) -> dict:
+    """
+    Devuelve la guerra con nuestro clan siempre en el lado "clan".
+
+    En una guerra de CWL, Supercell no garantiza que "clan" sea el nuestro:
+    puede venir como "opponent". Si no se corrige, los marcadores, los
+    miembros y los ataques de ambos bandos quedan intercambiados.
+    """
+    if datos.get("opponent", {}).get("tag") == nuestro_tag:
+        return {**datos, "clan": datos["opponent"], "opponent": datos.get("clan")}
+    return datos
 
 async def _persistir_guerra_liga(
     sesion: AsyncSession, datos: dict, war_tag: str, temporada: str, ronda: int
 ) -> Guerra | None:
     """Guarda o actualiza una guerra de CWL ya identificada, dado su JSON crudo."""
-    guerra_actual = GuerraActualOut.desde_api(datos)
+    guerra_actual = GuerraActualOut.desde_api(
+        _orientar_hacia_nuestro_clan(datos, normalizar_tag(settings.clan_tag))
+    )
 
     if guerra_actual.clan is None or guerra_actual.rival is None:
         return None
@@ -235,13 +284,5 @@ async def ultima_guerra_conocida(sesion: AsyncSession) -> Guerra | None:
         .where(Guerra.war_tag.is_(None))
         .order_by(Guerra.preparacion_inicio.desc())
         .limit(1)
-    )
-    return resultado.scalar_one_or_none()
-
-
-async def war_tag_de_ronda(sesion: AsyncSession, temporada: str, ronda: int) -> str | None:
-    """Devuelve el war tag ya conocido para una ronda de CWL, o None si no se ha resuelto todavía."""
-    resultado = await sesion.execute(
-        select(Guerra.war_tag).where(Guerra.liga_temporada == temporada, Guerra.liga_ronda == ronda)
     )
     return resultado.scalar_one_or_none()
