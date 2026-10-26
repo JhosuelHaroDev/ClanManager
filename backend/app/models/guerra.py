@@ -38,6 +38,9 @@ class Guerra(Base):
     liga_temporada: Mapped[str | None] = mapped_column(String(10))
     liga_ronda: Mapped[int | None]
 
+    # Mayor número de orden registrado dentro de las primeras 5h de batalla (Regla de Espejo)
+    max_orden_5h: Mapped[int | None]
+
     clan_tag: Mapped[str] = mapped_column(String(20))
     clan_nombre: Mapped[str] = mapped_column(String(50))
     clan_nivel: Mapped[int]

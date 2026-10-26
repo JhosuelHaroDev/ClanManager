@@ -1,5 +1,6 @@
 """Servicio para guardar y actualizar el registro de guerras, clásicas y de la Liga de Guerras de Clanes."""
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -197,7 +198,7 @@ async def _guardar_o_actualizar(
 
 
 def _actualizar_datos_generales(guerra: Guerra, actual: GuerraActualOut) -> None:
-    """Copia los campos simples de la guerra, sin tocar miembros ni ataques."""
+    """Copia los campos simples de la guerra y actualiza el corte de las 5 horas."""
     guerra.estado = actual.estado
     guerra.tamano_equipo = actual.tamano_equipo
     guerra.ataques_por_miembro = actual.ataques_por_miembro
@@ -218,6 +219,23 @@ def _actualizar_datos_generales(guerra: Guerra, actual: GuerraActualOut) -> None
     guerra.rival_nivel = actual.rival.nivel_clan
     guerra.rival_estrellas = actual.rival.estrellas
     guerra.rival_destruccion = actual.rival.destruccion
+
+    # Auditoría automática de la Regla de las 5 Horas:
+    # Si estamos dentro de las primeras 5 horas desde el inicio de batalla,
+    # guardamos el mayor 'orden' de ataque visto hasta ese instante.
+    if actual.inicio is not None:
+        ahora_utc = datetime.now(timezone.utc)
+        limite_5h = actual.inicio + timedelta(hours=5)
+        if ahora_utc <= limite_5h:
+            ordenes = [
+                atk.orden
+                for bando in (actual.clan, actual.rival)
+                if bando is not None
+                for m in bando.miembros
+                for atk in m.ataques_realizados
+            ]
+            max_actual = max(ordenes, default=0)
+            guerra.max_orden_5h = max(guerra.max_orden_5h or 0, max_actual)
 
 
 def _agregar_miembros_y_ataques(guerra: Guerra, bando: BandoGuerraOut, *, es_propio: bool) -> None:

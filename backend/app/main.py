@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import asaltos, capturas, clan, guerras, liga, miembros
+from app.api import asaltos, capturas, clan, guerras, liga, miembros, whatsapp
 from app.config import settings
 from app.scheduler import crear_programador
 from app.services.clash_client import ClashApiError, ClashClient, crear_cliente_http
@@ -58,6 +58,7 @@ app.include_router(guerras.router, prefix="/api")
 app.include_router(asaltos.router, prefix="/api")
 app.include_router(clan.router, prefix="/api")
 app.include_router(liga.router, prefix="/api")
+app.include_router(whatsapp.router, prefix="/api")
 
 
 @app.exception_handler(ClashApiError)
