@@ -278,10 +278,13 @@ def _fue_mencionada_stacy(texto: str, mencionados: list[str]) -> bool:
     bot_jid = f"{settings.bot_phone_number}@c.us"
     num_corto = settings.bot_phone_number.lstrip("51")
 
+    # 1. Si seleccionaron a Stacy de la lista desplegable con "@" en WhatsApp
     if bot_jid in mencionados:
         return True
-    if any(alias in t_low for alias in ("@stacy", "@s.t.a.c.y", "@clanmanager", "@clan manager")):
+    # 2. Si escribieron manualmente @Stacy o @S.T.A.C.Y.
+    if any(alias in t_low for alias in ("@stacy", "@s.t.a.c.y")):
         return True
+    # 3. Respaldo cuando WhatsApp convierte la mención de contacto en @51922982880
     if f"@{settings.bot_phone_number}" in t_low or f"@{num_corto}" in t_low:
         return True
     return False

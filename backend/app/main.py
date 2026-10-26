@@ -13,7 +13,12 @@ from app.config import settings
 from app.scheduler import crear_programador
 from app.services.clash_client import ClashApiError, ClashClient, crear_cliente_http
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+import sys
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
 
 
 @asynccontextmanager

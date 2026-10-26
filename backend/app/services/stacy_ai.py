@@ -284,7 +284,7 @@ async def procesar_consulta_stacy(
     t_inicio = time.monotonic()
 
     pregunta = re.sub(
-        r"(@S\.?T\.?A\.?C\.?Y\.?|@Clan\s*Manager|@" + settings.bot_phone_number + r"|@" + settings.bot_phone_number.lstrip("51") + r")",
+        r"(@S\.?T\.?A\.?C\.?Y\.?|@" + settings.bot_phone_number + r"|@" + settings.bot_phone_number.lstrip("51") + r")",
         "",
         str(mensaje_usuario or ""),
         flags=re.IGNORECASE,
