@@ -1,4 +1,4 @@
-"""Orquestador híbrido asíncrono en 2 etapas de S.T.A.C.Y. con memoria de corto plazo y telemetría."""
+"""Orquestador híbrido con Bucle Agéntico ReAct en Etapa 1 (Modelos Pesados) + Redactora Etapa 2."""
 
 import json
 import logging
@@ -23,44 +23,46 @@ from app.services.stacy_tools import (
 
 logger = logging.getLogger("clanmanager.stacy_ai")
 
-# Circuit breaker en memoria para modelos con error 429 (modelo -> timestamp de expiración)
 _CIRCUIT_BREAKER_429: dict[str, float] = {}
+MAX_ITERACIONES_ETAPA_1 = 3
 
-# ETAPA 1: 1° Gratis ultra rápidos (Groq/NVIDIA) -> 2° Respaldo de pago (Haiku 5.5)
+# 🔹 ETAPA 1: Modelos pesados para razonamiento multi-herramienta y verificación ReAct
 COLA_ENRUTADOR_ETAPA_1 = [
-    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-20b"},
-    {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
-    {"activo": True, "proveedor": "GROQ",      "modelo": "meta-llama/llama-4-scout-17b-16e-instruct"},
-    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-haiku-5-5"},
-]
-
-# ETAPA 2: 1° Gratis potentes (Groq/NVIDIA) -> 2° Respaldo de pago (Sonnet 5.5 / Haiku 5.5)
-COLA_REDACTOR_ETAPA_2 = [
     {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-120b"},
-    {"activo": True, "proveedor": "GROQ",      "modelo": "meta-llama/llama-4-scout-17b-16e-instruct"},
     {"activo": True, "proveedor": "GROQ",      "modelo": "qwen/qwen3-32b"},
     {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-20b"},
     {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-sonnet-5-5"},
     {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-haiku-5-5"},
 ]
+
+# 🔹 ETAPA 2: Modelos pesados para redacción final de S.T.A.C.Y.
+COLA_REDACTOR_ETAPA_2 = [
+    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-120b"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "qwen/qwen3-32b"},
+    {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "meta-llama/llama-4-scout-17b-16e-instruct"},
+    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-sonnet-5-5"},
+    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-haiku-5-5"},
+]
+
 HERRAMIENTAS_STACY = [
     {
         "name": "consultar_guerra_actual",
-        "description": "Consulta datos de guerra en PostgreSQL: 'actual' (en curso/preparación), 'pasada' (última terminada) o 'historial' (las 6+ guerras históricas, estadísticas acumuladas de jugadores en guerra o búsqueda por nombre de clan rival).",
+        "description": "Consulta y actualiza en tiempo real los datos de guerra en PostgreSQL: 'actual' (en curso/preparación), 'pasada' (última terminada) o 'historial' (las 6+ guerras históricas, estadísticas acumuladas de jugadores o búsqueda por nombre de clan rival).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "periodo": {"type": "string", "enum": ["actual", "pasada", "historial"]},
                 "filtro": {"type": "string", "enum": ["todos", "pendientes", "infractores", "plenos", "resumen"]},
                 "nombre_jugador": {"type": "string", "description": "Opcional. Nick limpio del jugador."},
-                "rival": {"type": "string", "description": "Opcional. Nombre parcial del clan rival para buscar una guerra pasada específica."},
-                "forzar_actualizacion": {"type": "boolean"},
+                "rival": {"type": "string", "description": "Opcional. Nombre parcial del clan rival."},
             },
         },
     },
     {
         "name": "consultar_bases_rivales",
-        "description": "Consulta las aldeas del clan enemigo en la guerra 'actual' o 'pasada'.",
+        "description": "Actualiza y consulta las aldeas del clan enemigo en la guerra 'actual' o 'pasada'.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -72,7 +74,7 @@ HERRAMIENTAS_STACY = [
     },
     {
         "name": "consultar_cwl_liga",
-        "description": "Consulta la tabla de clasificación de los 8 clanes y el rendimiento por rondas de nuestros miembros en la Liga de Guerras de Clanes (CWL).",
+        "description": "Actualiza y consulta la tabla de clasificación de los 8 clanes y el rendimiento por rondas en CWL.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -82,7 +84,7 @@ HERRAMIENTAS_STACY = [
     },
     {
         "name": "consultar_miembros_heroes",
-        "description": "Consulta el Roster Oficial del clan en PostgreSQL: rango, TH, escudo de guerra (IN/OUT), donaciones, estrellas y niveles de los 6 héroes (RB, RA, GC, LR, PE, DD).",
+        "description": "Consulta el Roster Oficial actualizado del clan: rango, TH, escudo de guerra (IN/OUT), donaciones, estrellas y niveles de los 6 héroes (RB, RA, GC, LR, PE, DD).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -97,7 +99,7 @@ HERRAMIENTAS_STACY = [
     },
     {
         "name": "consultar_jugador_en_vivo",
-        "description": "Petición en tiempo real a Supercell para UN miembro. Úsala SOLO cuando pidan equipamiento activo de héroes, puntos de Juegos del Clan o ataques ganados en temporada.",
+        "description": "Petición directa a Supercell para UN miembro. Úsala cuando pidan equipamiento activo de héroes, puntos de Juegos del Clan o ataques ganados en temporada.",
         "input_schema": {
             "type": "object",
             "properties": {"nombre_o_tag": {"type": "string"}},
@@ -106,7 +108,7 @@ HERRAMIENTAS_STACY = [
     },
     {
         "name": "consultar_asaltos_capital",
-        "description": "Consulta el Fin de Semana de Asaltos a la Capital: 'ranking' (oro, 6/6, incompletos, turistas) o 'bitacora' (golpes distrito por distrito, % antes/después).",
+        "description": "Actualiza y consulta el Fin de Semana de Asaltos a la Capital: 'ranking' (oro, 6/6, incompletos, turistas) o 'bitacora' (golpes distrito por distrito).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -131,12 +133,12 @@ HERRAMIENTAS_STACY = [
             "type": "object",
             "properties": {
                 "accion": {"type": "string", "enum": ["consultar", "guardar_relaciones"]},
-                "sujeto": {"type": "string", "description": "Nombre del jugador o entidad origen."},
+                "sujeto": {"type": "string"},
                 "tipo_relacion": {
                     "type": "string",
                     "enum": ["CAMBIO_ESPEJO_CON", "TIENE_AUSENCIA_JUSTIFICADA", "ES_CUENTA_SECUNDARIA_DE", "NOTA_TACTICA"],
                 },
-                "objeto": {"type": "string", "description": "Segundo jugador, motivo de ausencia o cuenta."},
+                "objeto": {"type": "string"},
                 "nota_explicativa": {"type": "string"},
             },
             "required": ["accion"],
@@ -144,7 +146,7 @@ HERRAMIENTAS_STACY = [
     },
     {
         "name": "consultar_guia_estrategica_coc",
-        "description": "Consulta la Biblioteca Táctica Oficial de S.T.A.C.Y. (Octubre 2026).",
+        "description": "Consulta la Biblioteca Táctica Oficial de S.T.A.C.Y. (equipamiento meta, ejércitos por TH, Hammer Jam, reglas).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -250,7 +252,6 @@ def _limpiar_formato_whatsapp(texto: str) -> str:
 
 
 async def _obtener_memoria_corto_plazo(sesion: AsyncSession, chat_id: str) -> str:
-    """Recupera las últimas 4 interacciones del chat en PostgreSQL para dar hilo conversacional."""
     if not chat_id:
         return ""
     res = await sesion.execute(
@@ -265,10 +266,10 @@ async def _obtener_memoria_corto_plazo(sesion: AsyncSession, chat_id: str) -> st
     ultimos = list(reversed(res.scalars().all()))
     if not ultimos:
         return ""
-    lineas = ["[MEMORIA RECIENTE DEL CHAT (Últimos mensajes para contexto)]:"]
+    lineas = ["[HISTORIAL RECIENTE DEL CHAT (Solo para contexto de conversación)]:"]
     for m in ultimos:
         autor = m.nombre_whatsapp or "Miembro"
-        resp_corta = (m.respuesta_stacy or "").split("\n━━━━━━━━━━━━")[0][:220].replace("\n", " ")
+        resp_corta = (m.respuesta_stacy or "").split("\n━━━━━━━━━━━━")[0][:200].replace("\n", " ")
         lineas.append(f"- {autor}: \"{m.mensaje_usuario[:120]}\" -> S.T.A.C.Y.: \"{resp_corta}...\"")
     return "\n".join(lineas) + "\n\n"
 
@@ -281,7 +282,10 @@ async def procesar_consulta_stacy(
     sesion: AsyncSession,
     cliente: ClashClient,
 ) -> dict:
-    """Ejecuta el pipeline híbrido de 2 etapas y devuelve el texto + telemetría."""
+    """
+    Ejecuta el ciclo agéntico ReAct en Etapa 1 (hasta 3 iteraciones de herramientas)
+    y luego pasa todos los datos verificados a la Etapa 2 (Redactora S.T.A.C.Y.).
+    """
     t_inicio = time.monotonic()
 
     pregunta = re.sub(
@@ -293,7 +297,7 @@ async def procesar_consulta_stacy(
 
     if not pregunta:
         return {
-            "respuesta": "⚡ *S.T.A.C.Y. EN LÍNEA*\n\nMis radares en PostgreSQL están operativos para *Melanie Stacy*. Etiquétame junto con tu consulta sobre guerra, aldeas abiertas, héroes, capital, ligas o acuerdos del clan.",
+            "respuesta": "⚡ *S.T.A.C.Y. EN LÍNEA*\n\nDime qué necesitas revisar del clan: guerra en vivo, historial, aldeas abiertas, héroes, capital, ligas o acuerdos en memoria.",
             "nivel_acceso": "GENERAL",
             "jugador_tag": None,
             "modelo_e1": "none",
@@ -306,36 +310,29 @@ async def procesar_consulta_stacy(
 
     perfil = await identificar_miembro_por_telefono(sesion, telefono_remitente)
     if perfil:
-        info_g = (
-            f" | Posición en Guerra Actual: {perfil['posicion_en_guerra_actual']} "
-            f"({perfil['ataques_en_guerra_actual']} tiros, Tiro 1: {perfil['tiro_1_guerra_actual'] or '-'})"
-            if perfil["posicion_en_guerra_actual"]
-            else " | No convocado o sin guerra activa"
-        )
         ctx_remitente = (
             f"[NIVEL DE ACCESO: {perfil['nivel_acceso']}]\n"
-            f"[Te escribe el miembro verificado del clan: {perfil['nombre_limpio']} "
-            f"(Llámale siempre \"{perfil['nombre_limpio']}\" | Rango: {perfil['rango']}, Tag: {perfil['tag']}, "
-            f"TH{perfil['th']}, Escudo: {perfil['escudo_guerra']}, Héroes: {perfil['estado_heroes']}{info_g})]\n"
+            f"[Remitente Verificado: {perfil['nombre_limpio']} | Rango en el clan: {perfil['rango']} | "
+            f"Tag: {perfil['tag']} | TH{perfil['th']}]\n"
         )
         nivel_acceso = perfil["nivel_acceso"]
         jugador_tag = perfil["tag"]
     else:
         ctx_remitente = (
-            "[NIVEL DE ACCESO: NO VINCULADO]\n"
-            f"[Remitente en WhatsApp: {nombre_remitente or 'Usuario'} | Estado: Su teléfono NO figura en `directorio_miembros` (Civil sin rango verificado)]\n"
+            "[NIVEL DE ACCESO: NO_VINCULADO]\n"
+            f"[Remitente en WhatsApp: {nombre_remitente or 'Usuario'} (Sin número vinculado en el directorio del clan)]\n"
         )
         nivel_acceso = "NO_VINCULADO"
         jugador_tag = None
 
     memoria_chat = await _obtener_memoria_corto_plazo(sesion, chat_id)
-    prompt_entrada = f"{memoria_chat}{ctx_remitente}Consulta actual del usuario: \"{pregunta}\""
+    prompt_base = f"{memoria_chat}{ctx_remitente}Mensaje del usuario: \"{pregunta}\""
 
     cola_e1 = _construir_cola_activa(1)
     cola_e2 = _construir_cola_activa(2)
     if not cola_e1 or not cola_e2:
         return {
-            "respuesta": "⚠️ *Error de Configuración:* Define al menos una API Key (`ANTHROPIC_API_KEY`, `GROQ_API_KEY` o `NVIDIA_API_KEY`) en tu archivo `.env`.",
+            "respuesta": "⚠️ *Error de Configuración:* Define al menos una API Key en las variables de entorno.",
             "nivel_acceso": nivel_acceso,
             "jugador_tag": jugador_tag,
             "modelo_e1": "err",
@@ -349,59 +346,99 @@ async def procesar_consulta_stacy(
     ahora_ts = time.time()
     historial_saltos = []
     modelo_e1 = "skip"
-    tools_usadas = []
-    datos_recolectados = []
+    tools_usadas: list[str] = []
+    datos_recolectados: list[dict] = []
+    firmas_ejecutadas: set[str] = set()
     tokens_totales = 0
     costo_total = 0.0
+    iteraciones_e1 = 0
 
-    async with httpx.AsyncClient(timeout=25.0) as http_ia:
+    async with httpx.AsyncClient(timeout=28.0) as http_ia:
         # =====================================================================
-        # 🔹 ETAPA 1: ENRUTADOR Y SELECTOR DE HERRAMIENTAS
+        # 🔹 ETAPA 1: BUCLE AGÉNTICO ReAct (Elige -> Ejecuta -> Verifica Suficiencia)
         # =====================================================================
-        for prov1 in cola_e1:
-            if _CIRCUIT_BREAKER_429.get(prov1["modelo"], 0) > ahora_ts:
-                historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}[429]")
-                continue
+        for ronda in range(1, MAX_ITERACIONES_ETAPA_1 + 1):
+            if ronda == 1:
+                prompt_iteracion = prompt_base
+            else:
+                prompt_iteracion = (
+                    f"{prompt_base}\n\n"
+                    f"[RESULTADOS OBTENIDOS EN ITERACIÓN PREVIA ({len(datos_recolectados)} herramienta(s))]:\n"
+                    f"{json.dumps(datos_recolectados, ensure_ascii=False)}\n\n"
+                    "[VERIFICACIÓN DE SUFICIENCIA]: Analiza si los datos de arriba ya son suficientes para "
+                    "responder todos los puntos del mensaje del usuario. Si necesitas cruzar información con OTRA "
+                    "herramienta que aún no hayas ejecutado, llámala ahora. Si los datos ya están completos, "
+                    "NO llames ninguna herramienta y responde únicamente: DATOS_COMPLETOS"
+                )
 
-            res1 = await _llamar_enrutador_etapa1(http_ia, prov1, prompt_entrada)
-            if res1["exito"]:
-                modelo_e1 = prov1["modelo"].split("/")[-1]
-                u1 = res1.get("usage") or {}
-                tokens_totales += sum(int(u1.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-                costo_total += _calcular_costo_usd(prov1["modelo"], u1)
+            exito_ronda = False
+            nuevas_tools_en_ronda = 0
 
-                for tc in res1.get("tool_calls", []):
-                    tools_usadas.append(tc["name"])
-                    args_tool = dict(tc.get("args") or {})
-                    if perfil and perfil.get("nombre_limpio"):
-                        args_tool["_remitente_verificado"] = perfil["nombre_limpio"]
-                    salida = await ejecutar_herramienta_stacy(tc["name"], args_tool, sesion, cliente)
-                    datos_recolectados.append({
-                        "herramienta": tc["name"],
-                        "resultado_datos": salida,
-                    })
+            for prov1 in cola_e1:
+                if _CIRCUIT_BREAKER_429.get(prov1["modelo"], 0) > ahora_ts:
+                    historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}[429]")
+                    continue
+
+                res1 = await _llamar_enrutador_etapa1(http_ia, prov1, prompt_iteracion)
+                if res1["exito"]:
+                    exito_ronda = True
+                    iteraciones_e1 = ronda
+                    modelo_e1 = prov1["modelo"].split("/")[-1]
+                    u1 = res1.get("usage") or {}
+                    tokens_totales += sum(
+                        int(u1.get(k) or 0)
+                        for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                    )
+                    costo_total += _calcular_costo_usd(prov1["modelo"], u1)
+
+                    tool_calls = res1.get("tool_calls") or []
+                    for tc in tool_calls:
+                        nombre_fn = tc["name"]
+                        args_tool = dict(tc.get("args") or {})
+                        firma = f"{nombre_fn}:{json.dumps(args_tool, sort_keys=True, ensure_ascii=False)}"
+
+                        # Evitar que re-ejecute exactamente la misma herramienta con los mismos argumentos
+                        if firma in firmas_ejecutadas:
+                            continue
+                        firmas_ejecutadas.add(firma)
+                        nuevas_tools_en_ronda += 1
+                        tools_usadas.append(nombre_fn)
+
+                        if perfil and perfil.get("nombre_limpio"):
+                            args_tool["_remitente_verificado"] = perfil["nombre_limpio"]
+
+                        salida = await ejecutar_herramienta_stacy(nombre_fn, args_tool, sesion, cliente)
+                        datos_recolectados.append({
+                            "herramienta": nombre_fn,
+                            "parametros": tc.get("args") or {},
+                            "resultado_datos": salida,
+                        })
+                    break
+
+                err1 = str(res1.get("error") or "")
+                if "429" in err1:
+                    _CIRCUIT_BREAKER_429[prov1["modelo"]] = ahora_ts + 60.0
+                historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}")
+
+            # Si el modelo decidió que no necesita más herramientas, salimos del bucle ReAct
+            if not exito_ronda or nuevas_tools_en_ronda == 0:
                 break
-
-            err1 = str(res1.get("error") or "")
-            if "429" in err1:
-                _CIRCUIT_BREAKER_429[prov1["modelo"]] = ahora_ts + 60.0
-            historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}")
 
         # =====================================================================
         # 🔹 ETAPA 2: CEREBRO REDACTOR DE S.T.A.C.Y.
         # =====================================================================
-        prompt_e2 = prompt_entrada
+        prompt_e2 = prompt_base
         if datos_recolectados:
             prompt_e2 += (
-                "\n\n[DATOS EN TIEMPO REAL EXTRAÍDOS DE POSTGRESQL]:\n"
+                "\n\n[DATOS EN TIEMPO REAL EXTRAÍDOS Y VERIFICADOS EN POSTGRESQL / API SUPERCELL]:\n"
                 f"{json.dumps(datos_recolectados, ensure_ascii=False)}\n\n"
-                "INSTRUCCIÓN: Redacta la respuesta final de S.T.A.C.Y. en ESPAÑOL basándote estrictamente en estos datos, "
-                "aplicando tu personalidad nivel 2.5, el Nivel de Acceso del remitente y el formato móvil de WhatsApp."
+                "INSTRUCCIÓN DE REDACCIÓN: Responde en ESPAÑOL basándote estrictamente en estos datos verificados. "
+                "Sé directa, natural y variada; NO menciones los héroes ni la guerra del remitente salvo que él haya preguntado por sí mismo."
             )
         else:
             prompt_e2 += (
-                "\n\n[NOTA DEL ENRUTADOR: No se requirió consultar tablas para este mensaje. "
-                "Responde directamente como S.T.A.C.Y. respetando el Nivel de Acceso del remitente y tu humor 2.5]."
+                "\n\n[NOTA: Consulta conversacional que no requirió extraer tablas. "
+                "Responde con naturalidad y brevedad como S.T.A.C.Y., sin inventar estadísticas]."
             )
 
         ultimo_err_e2 = ""
@@ -414,7 +451,10 @@ async def procesar_consulta_stacy(
             if res2["exito"] and res2.get("texto"):
                 modelo_e2 = prov2["modelo"].split("/")[-1]
                 u2 = res2.get("usage") or {}
-                tokens_totales += sum(int(u2.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+                tokens_totales += sum(
+                    int(u2.get(k) or 0)
+                    for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                )
                 costo_total += _calcular_costo_usd(prov2["modelo"], u2)
 
                 latencia = round(time.monotonic() - t_inicio, 1)
@@ -423,9 +463,10 @@ async def procesar_consulta_stacy(
                 if settings.mostrar_firma_modelo:
                     txt_costo = f" (${costo_total:.4f})" if costo_total > 0 else " ($0 Gratis)"
                     nota_salto = f"\n↪ _Saltó: {', '.join(historial_saltos)}_" if historial_saltos else ""
+                    info_tools = f"{len(tools_usadas)}t/{iteraciones_e1}i" if tools_usadas else "0t"
                     texto_final += (
                         f"\n━━━━━━━━━━━━\n🤖 _S.T.A.C.Y. [{modelo_e1} ➔ {modelo_e2}] • "
-                        f"🛠️ {len(tools_usadas)}t • ⏱️ {latencia}s • 🪙 {tokens_totales:,} tok{txt_costo}_{nota_salto}"
+                        f"🛠️ {info_tools} • ⏱️ {latencia}s • 🪙 {tokens_totales:,} tok{txt_costo}_{nota_salto}"
                     )
 
                 return {
@@ -465,7 +506,7 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
         tools_cache[-1]["cache_control"] = {"type": "ephemeral"}
         payload: dict = {
             "model": prov["modelo"],
-            "max_tokens": 450,
+            "max_tokens": 600,
             "system": [{"type": "text", "text": sys_prompt, "cache_control": {"type": "ephemeral"}}],
             "tools": tools_cache,
             "messages": [{"role": "user", "content": prompt_entrada}],
@@ -491,7 +532,6 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
         except httpx.HTTPError as e:
             return {"exito": False, "error": str(e)}
 
-    # OpenAI Compatible (Groq / NVIDIA)
     tools_oa = [
         {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
         for t in HERRAMIENTAS_STACY
@@ -506,7 +546,7 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
                 "tools": tools_oa,
                 "tool_choice": "auto",
                 "temperature": 0.1,
-                "max_tokens": 450,
+                "max_tokens": 600,
             },
         )
         if r.status_code != 200:
@@ -540,7 +580,7 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
             "messages": [{"role": "user", "content": prompt_datos}],
         }
         if not re.search(r"-5(\b|-|\.)", prov["modelo"]):
-            payload["temperature"] = 0.5
+            payload["temperature"] = 0.6
 
         try:
             r = await http.post(
@@ -551,7 +591,9 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
             if r.status_code != 200:
                 return {"exito": False, "error": f"HTTP {r.status_code}: {r.text[:140]}"}
             data = r.json()
-            texto = "\n".join(b["text"] for b in data.get("content", []) if b.get("type") == "text" and b.get("text")).strip()
+            texto = "\n".join(
+                b["text"] for b in data.get("content", []) if b.get("type") == "text" and b.get("text")
+            ).strip()
             if not texto:
                 return {"exito": False, "error": f"Sin texto ({data.get('stop_reason')})"}
             return {"exito": True, "texto": texto, "usage": data.get("usage")}
@@ -565,7 +607,7 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
             json={
                 "model": prov["modelo"],
                 "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt_datos}],
-                "temperature": 0.5,
+                "temperature": 0.6,
                 "max_tokens": 2048,
             },
         )

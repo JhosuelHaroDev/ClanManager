@@ -52,7 +52,7 @@ def _obtener_chat_id_principal() -> str | None:
     if not settings.allowed_group_id:
         return None
     grupos = [g.strip() for g in settings.allowed_group_id.split(",") if g.strip()]
-    return grupos[0] if grupos else None
+    return grupos[1] if grupos else None
 
 
 async def disparar_alerta_guerra(

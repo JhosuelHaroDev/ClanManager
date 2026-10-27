@@ -1,11 +1,11 @@
-"""Herramientas de datos en PostgreSQL, Grafo de Memoria y Biblioteca Táctica de S.T.A.C.Y."""
+"""Herramientas de datos en tiempo real sobre PostgreSQL + API Supercell para S.T.A.C.Y."""
 
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -53,8 +53,8 @@ async def identificar_miembro_por_telefono(
     sesion: AsyncSession, telefono_remitente: str | None
 ) -> dict | None:
     """
-    Cruza los últimos 9 dígitos del teléfono de WhatsApp con `directorio_miembros`
-    y enriquece su perfil con la última `Captura` y la `Guerra` activa en PostgreSQL.
+    Identifica al remitente por los últimos 9 dígitos de su WhatsApp en `directorio_miembros`.
+    Devuelve únicamente su identidad y rango para no contaminar todos los mensajes con datos repetitivos.
     """
     if not telefono_remitente:
         return None
@@ -75,11 +75,8 @@ async def identificar_miembro_por_telefono(
     tag_jugador = normalizar_tag(registro_dir.tag)
     rol_es = "Miembro"
     th = 15
-    escudo = "IN"
-    estado_heroes = "N/D"
     nombre_limpio = _limpiar_nick(registro_dir.nombre)
 
-    # Buscar sus datos más recientes en la última captura
     ultima_cap = await servicio_capturas.obtener_ultima_captura(sesion)
     if ultima_cap:
         cm = next((m for m in ultima_cap.miembros if m.tag == tag_jugador), None)
@@ -87,52 +84,17 @@ async def identificar_miembro_por_telefono(
             nombre_limpio = cm.nombre
             rol_es = ROL_TRADUCCION.get(cm.rol, cm.rol)
             th = cm.nivel_ayuntamiento
-            escudo = "IN" if (cm.preferencia_guerra or "in") == "in" else "OUT"
-            pct, est_cod, _ = _evaluar_progreso_heroes(cm)
-            estado_heroes = f"{pct}% ({est_cod})"
 
     es_alto_mando = rol_es.lower() in ("lider", "colider", "veterano")
 
-    info = {
+    return {
         "nombre_limpio": nombre_limpio,
         "tag": tag_jugador,
         "rango": rol_es,
         "nivel_acceso": "ALTO MANDO" if es_alto_mando else "MIEMBRO REGULAR",
         "th": th,
-        "escudo_guerra": escudo,
-        "estado_heroes": estado_heroes,
         "strikes": registro_dir.strikes_acumulados,
-        "posicion_en_guerra_actual": None,
-        "ataques_en_guerra_actual": None,
-        "tiro_1_guerra_actual": None,
     }
-
-    # Verificar si está en la guerra activa
-    res_g = await sesion.execute(
-        select(Guerra)
-        .order_by(Guerra.preparacion_inicio.desc())
-        .limit(1)
-        .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
-    )
-    guerra = res_g.scalar_one_or_none()
-    if guerra and guerra.estado in ("preparation", "inWar"):
-        gm = next(
-            (m for m in guerra.miembros if m.es_propio and m.tag == tag_jugador),
-            None,
-        )
-        if gm:
-            mis_atks = sorted(
-                [a for a in guerra.ataques if a.atacante_tag == tag_jugador],
-                key=lambda x: x.orden,
-            )
-            perm = guerra.ataques_por_miembro or (1 if guerra.war_tag else 2)
-            info["posicion_en_guerra_actual"] = f"#{gm.posicion_mapa}"
-            info["ataques_en_guerra_actual"] = f"{len(mis_atks)}/{perm}"
-            if mis_atks:
-                a1 = mis_atks[0]
-                info["tiro_1_guerra_actual"] = f"{a1.destruccion:.0f}%({a1.estrellas}*)"
-
-    return info
 
 
 def _evaluar_progreso_heroes(cm: CapturaMiembro) -> tuple[float, str, str]:
@@ -165,13 +127,32 @@ def _evaluar_progreso_heroes(cm: CapturaMiembro) -> tuple[float, str, str]:
     return pct, est, resumen_h
 
 
+async def _asegurar_captura_fresca(
+    sesion: AsyncSession, cliente: ClashClient, max_edad_segundos: int = 180
+) -> Captura:
+    """
+    Garantiza que la captura de miembros/héroes esté actualizada.
+    Si tiene más de 3 minutos (180s), descarga una nueva con el semáforo de 6 conexiones (~1.5s).
+    """
+    ahora = datetime.now(timezone.utc)
+    captura = await servicio_capturas.obtener_ultima_captura(sesion)
+    if captura is None or (ahora - captura.capturado_en).total_seconds() > max_edad_segundos:
+        try:
+            captura = await servicio_capturas.crear_captura(sesion, cliente)
+        except ClashApiError as exc:
+            logger.warning("No se pudo refrescar captura en vivo, usando última en BD: %s", exc)
+            if captura is None:
+                raise
+    return captura
+
+
 async def ejecutar_herramienta_stacy(
     nombre_funcion: str,
     args: dict,
     sesion: AsyncSession,
     cliente: ClashClient,
 ) -> dict:
-    """Enrutador principal de herramientas de S.T.A.C.Y. sobre PostgreSQL."""
+    """Enrutador principal de herramientas de S.T.A.C.Y. con refresco en tiempo real."""
     try:
         if nombre_funcion == "consultar_guerra_actual":
             return await _tool_consultar_guerra_actual(args, sesion, cliente)
@@ -200,16 +181,20 @@ async def ejecutar_herramienta_stacy(
 
 
 # =========================================================================
-# TOOL 1: GUERRA ACTUAL / PASADA (DESDE POSTGRESQL + GRAFO DE ACUERDOS)
+# TOOL 1: GUERRA ACTUAL / PASADA / HISTORIAL (REFRESCO AL ÚLTIMO SEGUNDO)
 # =========================================================================
 async def _obtener_guerra_objetivo(
     sesion: AsyncSession,
     cliente: ClashClient,
     periodo: str,
-    forzar: bool,
     rival_buscado: str | None = None,
 ) -> tuple[Guerra | None, str | None]:
-    ahora = datetime.now(timezone.utc)
+    # Siempre sincronizar la guerra actual al último segundo desde Supercell (~0.2s)
+    if periodo == "actual" and not rival_buscado:
+        try:
+            await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+        except ClashApiError as exc:
+            logger.warning("Aviso al refrescar guerra en vivo: %s", exc)
 
     res = await sesion.execute(
         select(Guerra)
@@ -218,27 +203,6 @@ async def _obtener_guerra_objetivo(
         .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
     )
     ultimas = list(res.scalars().all())
-
-    necesita_sondeo = forzar or not ultimas
-    if ultimas and not necesita_sondeo:
-        g_top = ultimas[0]
-        edad_min = (ahora - g_top.ultima_actualizacion_en).total_seconds() / 60.0
-        if g_top.estado in ("preparation", "inWar") and edad_min > 8:
-            necesita_sondeo = True
-
-    if necesita_sondeo:
-        try:
-            await servicio_guerras.guardar_guerra_actual(sesion, cliente)
-            res = await sesion.execute(
-                select(Guerra)
-                .order_by(Guerra.preparacion_inicio.desc())
-                .limit(15)
-                .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
-            )
-            ultimas = list(res.scalars().all())
-        except ClashApiError:
-            pass
-
     if not ultimas:
         return None, None
 
@@ -282,13 +246,11 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
     )
     ataques_rivales = [a for a in guerra.ataques if a.atacante_tag in riv_por_tag]
 
-    # Corte de las 5 horas
     max_order_5h = guerra.max_orden_5h or 0
     if not es_cwl and guerra.inicio and max_order_5h == 0:
         if ahora <= guerra.inicio + timedelta(hours=5):
             max_order_5h = max((a.orden for a in guerra.ataques), default=0)
 
-    # Mejor ataque recibido por cada rival y por cada miembro propio
     mejor_contra_rival: dict[str, tuple[int, float]] = {}
     for a in nuestros_ataques:
         prev = mejor_contra_rival.get(a.defensor_tag, (-1, -1.0))
@@ -300,17 +262,6 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
         prev = mejor_contra_propio.get(a.defensor_tag, (-1, -1.0))
         if (a.estrellas, a.destruccion) > prev:
             mejor_contra_propio[a.defensor_tag] = (a.estrellas, a.destruccion)
-
-    # Detectar invasiones de espejo <5h
-    espejo_invadido_por: dict[int, str] = {}
-    for a in nuestros_ataques:
-        atacante = prop_por_tag.get(a.atacante_tag)
-        defensor = riv_por_tag.get(a.defensor_tag)
-        if atacante and defensor and a.orden <= max_order_5h:
-            if atacante.posicion_mapa != defensor.posicion_mapa:
-                espejo_invadido_por.setdefault(
-                    defensor.posicion_mapa, f"#{atacante.posicion_mapa} {atacante.nombre}"
-                )
 
     filas = []
     for p in propios:
@@ -338,13 +289,15 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
         else:
             est_riv_txt = f"{best_riv[1]:.0f}% {best_riv[0]}* (Abierta)"
 
-        # Evaluar infracciones y observaciones
         infracciones = []
         if not es_cwl:
             for idx_t, atk in enumerate(mis_tiros):
                 def_riv = riv_por_tag.get(atk.defensor_tag)
                 def_pos = def_riv.posicion_mapa if def_riv else 0
-                par_nombres = (p.nombre.lower(), (riv_por_pos.get(def_pos).nombre.lower() if riv_por_pos.get(def_pos) else ""))
+                par_nombres = (
+                    p.nombre.lower(),
+                    (riv_por_pos.get(def_pos).nombre.lower() if riv_por_pos.get(def_pos) else ""),
+                )
                 if atk.orden <= max_order_5h and def_pos != pos and par_nombres not in cambios_autorizados:
                     if idx_t == 0:
                         infracciones.append(f"Infraccion(<5h): Ataco #{def_pos} ignorando espejo #{pos}")
@@ -359,7 +312,7 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
             obs = f"Dejo 1 tiro colgado (1/{perm})" if guerra.estado == "warEnded" else f"Falta 2do tiro (1/{perm})"
         else:
             stars_tot = sum(a.estrellas for a in mis_tiros)
-            obs = f"Doble Pleno (6*)" if stars_tot == perm * 3 else f"Cumplio ({stars_tot}*)"
+            obs = "Doble Pleno (6*)" if stars_tot == perm * 3 else f"Cumplio ({stars_tot}*)"
 
         filas.append({
             "pos": pos,
@@ -377,7 +330,6 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
             "obs": obs,
         })
 
-    # Fase de tiempo y marcador
     if guerra.estado == "warEnded":
         fase_txt = "Guerra Finalizada"
     elif guerra.estado == "preparation" and guerra.inicio:
@@ -426,7 +378,6 @@ async def _tool_consultar_guerra_actual(
     rival_buscado = args.get("rival")
     buscar_jug = _limpiar_nick(args.get("nombre_jugador")).lower()
 
-    # Si piden el historial global de guerras (sin especificar un rival puntual)
     if periodo == "historial" and not rival_buscado:
         res_h = await sesion.execute(
             select(Guerra)
@@ -445,7 +396,11 @@ async def _tool_consultar_guerra_actual(
         for g in guerras_hist:
             paq = _reconstruir_estado_guerra(g, set())
             fecha_g = g.inicio.strftime("%d/%m/%Y") if g.inicio else "N/D"
-            res_txt = "VICTORIA" if g.clan_estrellas > g.rival_estrellas else ("DERROTA" if g.clan_estrellas < g.rival_estrellas else "EMPATE")
+            res_txt = (
+                "VICTORIA"
+                if g.clan_estrellas > g.rival_estrellas
+                else ("DERROTA" if g.clan_estrellas < g.rival_estrellas else "EMPATE")
+            )
             tabla_guerras.append(
                 f"{fecha_g}|vs {g.rival_nombre}|{g.tamano_equipo}v{g.tamano_equipo}|"
                 f"{g.clan_estrellas}*({g.clan_destruccion:.1f}%) a {g.rival_estrellas}*({g.rival_destruccion:.1f}%)|{res_txt}"
@@ -454,7 +409,16 @@ async def _tool_consultar_guerra_actual(
                 k = f["nick"].lower()
                 st = acum_jugadores.setdefault(
                     k,
-                    {"nick": f["nick"], "th": f["th"], "guerras": 0, "usados": 0, "perm": 0, "plenos": 0, "ceros": 0, "infracciones": 0},
+                    {
+                        "nick": f["nick"],
+                        "th": f["th"],
+                        "guerras": 0,
+                        "usados": 0,
+                        "perm": 0,
+                        "plenos": 0,
+                        "ceros": 0,
+                        "infracciones": 0,
+                    },
                 )
                 st["guerras"] += 1
                 st["usados"] += f["usados"]
@@ -484,13 +448,10 @@ async def _tool_consultar_guerra_actual(
             ],
         }
 
-    forzar = bool(args.get("forzar_actualizacion", False))
-    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo, forzar, rival_buscado)
-
+    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo, rival_buscado)
     if guerra is None:
         return {"estado": "No hay guerras registradas todavía en PostgreSQL."}
 
-    # Consultar si hay acuerdos de cambio de espejo en el Grafo de Memoria
     res_grafo = await sesion.execute(
         select(StacyAristaGrafo)
         .where(
@@ -510,22 +471,12 @@ async def _tool_consultar_guerra_actual(
         n2 = ar.nodo_destino.nombre_entidad.lower()
         cambios_set.add((n1, n2))
         cambios_set.add((n2, n1))
-        notas_acuerdos.append(f"{ar.nodo_origen.nombre_entidad} <-> {ar.nodo_destino.nombre_entidad} ({ar.nota_explicativa or 'Cambio espejo'})")
+        notas_acuerdos.append(
+            f"{ar.nodo_origen.nombre_entidad} <-> {ar.nodo_destino.nombre_entidad} ({ar.nota_explicativa or 'Cambio espejo'})"
+        )
 
     paquete = _reconstruir_estado_guerra(guerra, cambios_set)
     filtro = str(args.get("filtro") or "todos").lower()
-    buscar_jug = _limpiar_nick(args.get("nombre_jugador")).lower()
-    remitente_verif = _limpiar_nick(args.get("_remitente_verificado")).lower()
-
-    linea_remitente = "No convocado en esta guerra o no vinculado."
-    if remitente_verif:
-        f_rem = next((x for x in paquete["filas"] if x["nick"].lower() == remitente_verif), None)
-        if f_rem:
-            linea_remitente = (
-                f"#{f_rem['pos']}|{f_rem['nick']}[TH{f_rem['th']}]|Tiros:{f_rem['tiros']}|"
-                f"T1:{f_rem['t1']}|T2:{f_rem['t2']}|Def:{f_rem['def']}|"
-                f"EspejoRival(#{f_rem['pos']}):{f_rem['estado_rival']}|Obs:{f_rem['obs']}"
-            )
 
     if buscar_jug:
         exactos = [x for x in paquete["filas"] if x["nick"].lower() == buscar_jug]
@@ -551,7 +502,12 @@ async def _tool_consultar_guerra_actual(
             if "infraccion" in x["obs"].lower() or "no ataco" in x["obs"].lower():
                 infractores.append(f"#{x['pos']}|{x['nick']}[TH{x['th']}]|{x['obs']}|T1:{x['t1']}|T2:{x['t2']}")
             if "Doble Pleno" in x["obs"] or ("3*" in x["t1"] and x["perm"] == 1):
-                cracks.append(f"#{x['pos']}|{x['nick']}[TH{x['th']}]|T1:{x['t1']}{(' + T2:' + x['t2']) if x['t2'] not in ('-', 'N/A(CWL)') else ''}")
+                cracks.append(
+                    f"#{x['pos']}|{x['nick']}[TH{x['th']}]|T1:{x['t1']}{(' + T2:' + x['t2']) if x['t2'] not in ('-', 'N/A(CWL)') else ''}"
+                )
+            elif "3*" in x["t1"] or "3*" in x["t2"]:
+                cracks.append(f"#{x['pos']}|{x['nick']}[TH{x['th']}]|T1:{x['t1']} | T2:{x['t2']}")
+
             if x["usados"] == 0:
                 sin_atacar_0.append(f"#{x['pos']} {x['nick']}[TH{x['th']}] ({x['tiros']})")
             elif x["usados"] < x["perm"]:
@@ -562,16 +518,15 @@ async def _tool_consultar_guerra_actual(
         return {
             "aviso": aviso,
             "marcador": paquete["marcador"],
-            "tu_desempeno_personal": linea_remitente,
             "acuerdos_memoria_grafo": notas_acuerdos or None,
             "infractores_reglamento": infractores or ["Ninguno"],
-            "cracks_plenos": cracks[:10],
+            "jugadores_con_plenos": cracks[:12],
             "sin_atacar_0_tiros_total": len(sin_atacar_0),
             "sin_atacar_0_tiros_lista": sin_atacar_0,
             "falta_1_tiro_total": len(falta_1),
             "falta_1_tiro_lista": falta_1,
             "bases_rivales_abiertas_total": len(bases_abiertas),
-            "bases_rivales_abiertas_muestra": bases_abiertas[:12],
+            "bases_rivales_abiertas_muestra": bases_abiertas[:15],
         }
 
     filtrados = []
@@ -586,7 +541,6 @@ async def _tool_consultar_guerra_actual(
     return {
         "aviso": aviso,
         "marcador": paquete["marcador"],
-        "tu_desempeno_personal": linea_remitente,
         "filtro": filtro,
         "total": len(filtrados),
         "columnas": "Pos|Nick|TH|Tiros|Tiro1|Tiro2|Observacion",
@@ -598,13 +552,13 @@ async def _tool_consultar_guerra_actual(
 
 
 # =========================================================================
-# TOOL 2: BASES RIVALES (DESDE POSTGRESQL)
+# TOOL 2: BASES RIVALES (REFRESCO EN TIEMPO REAL)
 # =========================================================================
 async def _tool_consultar_bases_rivales(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
     periodo = str(args.get("periodo") or "actual").lower()
-    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo, False)
+    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo)
     if guerra is None:
         return {"estado": "No hay datos de guerra en PostgreSQL."}
 
@@ -624,7 +578,9 @@ async def _tool_consultar_bases_rivales(
             continue
         if estado_f == "cerradas" and not cerrada:
             continue
-        bases.append(f"#{x['pos']}|TH{x['rival_th']}|{x['rival_nick']}|{x['estado_rival']}|Espejo:{x['nick']}({x['tiros']})")
+        bases.append(
+            f"#{x['pos']}|TH{x['rival_th']}|{x['rival_nick']}|{x['estado_rival']}|Espejo:{x['nick']}({x['tiros']})"
+        )
 
     return {
         "aviso": aviso,
@@ -636,19 +592,17 @@ async def _tool_consultar_bases_rivales(
 
 
 # =========================================================================
-# TOOL 2B: RESUMEN DE LIGA DE GUERRAS DE CLANES (CWL EN POSTGRESQL)
+# TOOL 2B: LIGA DE GUERRAS DE CLANES (CWL EN TIEMPO REAL)
 # =========================================================================
 async def _tool_consultar_cwl_liga(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
-    temporada = args.get("temporada") or await servicio_liga.temporada_mas_reciente(sesion)
-    if temporada is None:
-        try:
-            await servicio_guerras.guardar_liga_actual(sesion, cliente)
-            temporada = await servicio_liga.temporada_mas_reciente(sesion)
-        except ClashApiError:
-            pass
+    try:
+        await servicio_guerras.guardar_liga_actual(sesion, cliente)
+    except ClashApiError:
+        pass
 
+    temporada = args.get("temporada") or await servicio_liga.temporada_mas_reciente(sesion)
     if temporada is None:
         return {"estado": "No hay ninguna temporada de CWL registrada actualmente."}
 
@@ -676,14 +630,12 @@ async def _tool_consultar_cwl_liga(
 
 
 # =========================================================================
-# TOOL 3: ROSTER DE MIEMBROS, 6 HÉROES Y DONACIONES (DESDE POSTGRESQL)
+# TOOL 3: ROSTER DE MIEMBROS, 6 HÉROES Y DONACIONES (FRESCO CON SEMÁFORO)
 # =========================================================================
 async def _tool_consultar_miembros_heroes(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
-    captura = await servicio_capturas.obtener_ultima_captura(sesion)
-    if captura is None:
-        captura = await servicio_capturas.crear_captura(sesion, cliente)
+    captura = await _asegurar_captura_fresca(sesion, cliente, max_edad_segundos=180)
 
     res_dir = await sesion.execute(select(DirectorioMiembro))
     mapa_dir = {normalizar_tag(d.tag): d for d in res_dir.scalars().all()}
@@ -842,11 +794,17 @@ async def _tool_consultar_jugador_en_vivo(args: dict, cliente: ClashClient) -> d
 
 
 # =========================================================================
-# TOOL 4: ASALTOS A LA CAPITAL (RANKING Y BITÁCORA DESDE POSTGRESQL)
+# TOOL 4: ASALTOS A LA CAPITAL (REFRESCO AL ÚLTIMO SEGUNDO)
 # =========================================================================
 async def _tool_consultar_asaltos_capital(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
+    # Sincronizar siempre en tiempo real desde Supercell (~0.25s)
+    try:
+        await servicio_asaltos.guardar_asalto_actual(sesion, cliente)
+    except ClashApiError as exc:
+        logger.warning("Aviso al refrescar asaltos en vivo: %s", exc)
+
     res = await sesion.execute(
         select(AsaltoCapital)
         .order_by(AsaltoCapital.inicio.desc())
@@ -860,9 +818,6 @@ async def _tool_consultar_asaltos_capital(
     )
     asalto = res.scalar_one_or_none()
     if asalto is None:
-        asalto = await servicio_asaltos.guardar_asalto_actual(sesion, cliente)
-
-    if asalto is None:
         return {"error": "No hay temporadas de Asaltos a la Capital registradas."}
 
     tipo = str(args.get("tipo_consulta") or "ranking").lower()
@@ -874,7 +829,6 @@ async def _tool_consultar_asaltos_capital(
         registros_ofensivos = [r for r in asalto.registros if r.sentido == "ofensivo"]
         for reg in reversed(registros_ofensivos):
             for dist in reversed(reg.distritos):
-                # Reconstruir cronológicamente (0% -> 100%)
                 atks_cron = list(reversed(dist.ataques))
                 acum = 0
                 golpes_dist = []
@@ -920,8 +874,7 @@ async def _tool_consultar_asaltos_capital(
             ],
         }
 
-    # Ranking general cruzado con la última captura de miembros del clan
-    ultima_cap = await servicio_capturas.obtener_ultima_captura(sesion)
+    ultima_cap = await _asegurar_captura_fresca(sesion, cliente, max_edad_segundos=300)
     miembros_clan = {m.tag: m.nombre for m in ultima_cap.miembros} if ultima_cap else {}
     mapa_asaltantes = {m.tag: m for m in asalto.miembros}
 
@@ -931,7 +884,11 @@ async def _tool_consultar_asaltos_capital(
         if am:
             perm = am.limite_ataques + am.ataques_bono
             prom = round(am.oro_capital_saqueado / am.ataques_usados) if am.ataques_usados > 0 else 0
-            obs = "Completo+Bonus" if (am.ataques_usados == perm and am.ataques_bono > 0) else ("Completo" if am.ataques_usados == perm else "Incompleto")
+            obs = (
+                "Completo+Bonus"
+                if (am.ataques_usados == perm and am.ataques_bono > 0)
+                else ("Completo" if am.ataques_usados == perm else "Incompleto")
+            )
             ranking.append({
                 "nick": nombre_c,
                 "usados": am.ataques_usados,
@@ -952,7 +909,6 @@ async def _tool_consultar_asaltos_capital(
                 "obs": "Sin Ataques",
             })
 
-    # Detectar turistas
     for am in asalto.miembros:
         if miembros_clan and am.tag not in miembros_clan:
             perm = am.limite_ataques + am.ataques_bono
@@ -1004,26 +960,32 @@ async def _tool_consultar_asaltos_capital(
 
 
 # =========================================================================
-# TOOL 5: HISTORIAL DE LIGAS Y EVOLUCIÓN (DESDE CAPTURAS EN POSTGRESQL)
+# TOOL 5: HISTORIAL DE LIGAS Y EVOLUCIÓN (CON CAPTURA FRESCA)
 # =========================================================================
 async def _tool_consultar_historial_ligas(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
+    await _asegurar_captura_fresca(sesion, cliente, max_edad_segundos=180)
+
     res = await sesion.execute(
         select(Captura)
         .order_by(Captura.capturado_en.desc())
-        .limit(2)
+        .limit(10)
         .options(selectinload(Captura.miembros))
     )
     capturas = list(res.scalars().all())
     if not capturas:
-        nueva = await servicio_capturas.crear_captura(sesion, cliente)
-        capturas = [nueva]
+        return {"error": "No hay capturas registradas en PostgreSQL."}
 
     cap_actual = capturas[0]
-    cap_anterior = capturas[1] if len(capturas) > 1 else None
-    mapa_ant = {m.tag: m for m in cap_anterior.miembros} if cap_anterior else {}
+    # Buscar una captura previa suficientemente separada en el tiempo (o la más antigua disponible)
+    cap_anterior = capturas[-1] if len(capturas) > 1 else None
+    for c in capturas[1:]:
+        if (cap_actual.capturado_en - c.capturado_en).total_seconds() >= 3600:
+            cap_anterior = c
+            break
 
+    mapa_ant = {m.tag: m for m in cap_anterior.miembros} if cap_anterior else {}
     buscar_jug = _limpiar_nick(args.get("nombre_jugador")).lower()
     jugadores = []
 
@@ -1071,7 +1033,7 @@ async def _tool_consultar_historial_ligas(
 
 
 # =========================================================================
-# TOOL 6 (NUEVA v3.0): GESTIÓN DEL GRAFO DE MEMORIA Y DIRECTORIO DE S.T.A.C.Y.
+# TOOL 6: GESTIÓN DEL GRAFO DE MEMORIA DE S.T.A.C.Y.
 # =========================================================================
 async def _tool_gestionar_memoria_grafo(args: dict, sesion: AsyncSession) -> dict:
     accion = str(args.get("accion") or "consultar").lower()
@@ -1117,7 +1079,6 @@ async def _tool_gestionar_memoria_grafo(args: dict, sesion: AsyncSession) -> dic
             "registrado_por": autor,
         }
 
-    # Acción por defecto: consultar recuerdos activos en el grafo
     buscar = str(args.get("sujeto") or "").strip().lower()
     res_a = await sesion.execute(
         select(StacyAristaGrafo)
@@ -1147,7 +1108,7 @@ async def _tool_gestionar_memoria_grafo(args: dict, sesion: AsyncSession) -> dic
 
 
 # =========================================================================
-# TOOL 7: BIBLIOTECA TÁCTICA MODULAR (CAPA 3 - 5 CATEGORÍAS)
+# TOOL 7: BIBLIOTECA TÁCTICA MODULAR
 # =========================================================================
 def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
     cat = str(args.get("categoria") or "normativa_y_rangos_stacy").lower()
@@ -1171,7 +1132,6 @@ def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
                 "DD|Aliento Igneo + Escamas de Magma",
             ],
             "topes_por_th": topes_tabla,
-            "angulo_sarcasmo_stacy": "De nada sirve equipamiento Epico al maximo si llevan al heroe con 30 niveles de retraso; es como ponerle aleron de Formula 1 a una carreta.",
         }
 
     if cat == "estrategias_ataque_por_th":
@@ -1186,7 +1146,6 @@ def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
                 "Super Archer Blimp + Hydra|Dirigible Superarqueras (2 Clon + 1 Furia + 5 Invis) + Dragones y Jinetes de Dragon",
                 "Queen Charge Hybrid|Reina con 5 Sanadoras elimina CC/TH + Mineros y Montapuercos con Centinela",
             ],
-            "angulo_sarcasmo_stacy": "Soltar todos los Dragones en una esquina y rezarle a Supercell no cuenta como estrategia tactica.",
         }
 
     if cat == "economia_y_eventos_2026":
@@ -1194,7 +1153,6 @@ def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
             "categoria": "economia_y_eventos_2026",
             "hammer_jam": "Martillomania (previo a TH19): 50% descuento en costos y tiempos. Ahorrar Medallas CWL, Pocimas de Constructor, Libros y Runas.",
             "minerales": "Mantenerse en ligas Dragon, Electro o Legend por Bono Estelar diario de Glowy/Shiny Ore y jugar guerra continua por Starry Ore.",
-            "angulo_sarcasmo_stacy": "Gastar Medallas de CWL en recursos para muros fuera de Martillomania deberia ser delito financiero en el clan.",
         }
 
     if cat == "capital_y_modos_clan":
@@ -1202,7 +1160,6 @@ def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
             "categoria": "capital_y_modos_clan",
             "capital": "Obligatorio 6/6 tiros. Quedar 5/5 = 1 Strike. Ley Anti-Egoismo: prohibido dejar distritos en 90%-99% si te quedan ataques.",
             "ligas_tropas": "Evalua cambio de Franja/Division (SUBIO, BAJO, IGUAL) ignorando variaciones menores de copas.",
-            "angulo_sarcasmo_stacy": "Dejar un distrito al 98% esperando que otro gaste su tiro por 200 de oro es como dejar un milimetro de leche en la jarra para no lavarla.",
         }
 
     return {
@@ -1210,12 +1167,11 @@ def _tool_consultar_guia_estrategica_coc(args: dict) -> dict:
         "guerra_clasica": "Primeras 5h solo ataque a espejo (# contra #) con 1er tiro. Si invaden tu espejo, NO robes otro; espera a las 5h (Mapa Libre). Obligatorio 2/2 tiros.",
         "cwl": "24h ataque exclusivo a espejo (1/1), salvo cambio acordado o autorizado por el Lider.",
         "cuotas": "Capital 6/6 obligatorio | Juegos del Clan 2,000 pts minimo | Inactividad max 3 dias sin aviso.",
-        "angulo_sarcasmo_stacy": "Las reglas son mas faciles que la tabla del 2, pero siempre hay quien cree que el reloj de las 5 horas esta de adorno.",
     }
 
 
 # =========================================================================
-# TOOL 8: BÚSQUEDA WEB EN CASCADA ASÍNCRONA (TAVILY -> GOOGLE SEARCH)
+# TOOL 8: BÚSQUEDA WEB EN CASCADA ASÍNCRONA
 # =========================================================================
 async def _tool_buscar_en_internet(args: dict) -> dict:
     query = str(args.get("consulta") or "").strip()
