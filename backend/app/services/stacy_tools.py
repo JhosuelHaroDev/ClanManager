@@ -203,15 +203,18 @@ async def ejecutar_herramienta_stacy(
 # TOOL 1: GUERRA ACTUAL / PASADA (DESDE POSTGRESQL + GRAFO DE ACUERDOS)
 # =========================================================================
 async def _obtener_guerra_objetivo(
-    sesion: AsyncSession, cliente: ClashClient, periodo: str, forzar: bool
+    sesion: AsyncSession,
+    cliente: ClashClient,
+    periodo: str,
+    forzar: bool,
+    rival_buscado: str | None = None,
 ) -> tuple[Guerra | None, str | None]:
     ahora = datetime.now(timezone.utc)
 
-    # Sondear en vivo si se fuerza o si la última guerra activa tiene >10 min sin actualizar
     res = await sesion.execute(
         select(Guerra)
         .order_by(Guerra.preparacion_inicio.desc())
-        .limit(2)
+        .limit(15)
         .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
     )
     ultimas = list(res.scalars().all())
@@ -229,7 +232,7 @@ async def _obtener_guerra_objetivo(
             res = await sesion.execute(
                 select(Guerra)
                 .order_by(Guerra.preparacion_inicio.desc())
-                .limit(2)
+                .limit(15)
                 .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
             )
             ultimas = list(res.scalars().all())
@@ -239,13 +242,18 @@ async def _obtener_guerra_objetivo(
     if not ultimas:
         return None, None
 
+    if rival_buscado:
+        r_low = rival_buscado.strip().lower()
+        for g in ultimas:
+            if r_low in g.rival_nombre.lower():
+                return g, None
+
     if periodo in ("pasada", "anterior"):
         terminadas = [g for g in ultimas if g.estado == "warEnded"]
         if terminadas:
             return terminadas[0], None
         return ultimas[-1], "Mostrando la única guerra registrada en base de datos."
 
-    # Piden guerra "actual"
     g_reciente = ultimas[0]
     if g_reciente.estado == "warEnded":
         return (
@@ -415,8 +423,69 @@ async def _tool_consultar_guerra_actual(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
     periodo = str(args.get("periodo") or "actual").lower()
+    rival_buscado = args.get("rival")
+    buscar_jug = _limpiar_nick(args.get("nombre_jugador")).lower()
+
+    # Si piden el historial global de guerras (sin especificar un rival puntual)
+    if periodo == "historial" and not rival_buscado:
+        res_h = await sesion.execute(
+            select(Guerra)
+            .where(Guerra.estado == "warEnded")
+            .order_by(Guerra.preparacion_inicio.desc())
+            .limit(15)
+            .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
+        )
+        guerras_hist = list(res_h.scalars().all())
+        if not guerras_hist:
+            return {"estado": "Aún no hay guerras finalizadas en el historial de PostgreSQL."}
+
+        tabla_guerras = []
+        acum_jugadores: dict[str, dict] = {}
+
+        for g in guerras_hist:
+            paq = _reconstruir_estado_guerra(g, set())
+            fecha_g = g.inicio.strftime("%d/%m/%Y") if g.inicio else "N/D"
+            res_txt = "VICTORIA" if g.clan_estrellas > g.rival_estrellas else ("DERROTA" if g.clan_estrellas < g.rival_estrellas else "EMPATE")
+            tabla_guerras.append(
+                f"{fecha_g}|vs {g.rival_nombre}|{g.tamano_equipo}v{g.tamano_equipo}|"
+                f"{g.clan_estrellas}*({g.clan_destruccion:.1f}%) a {g.rival_estrellas}*({g.rival_destruccion:.1f}%)|{res_txt}"
+            )
+            for f in paq["filas"]:
+                k = f["nick"].lower()
+                st = acum_jugadores.setdefault(
+                    k,
+                    {"nick": f["nick"], "th": f["th"], "guerras": 0, "usados": 0, "perm": 0, "plenos": 0, "ceros": 0, "infracciones": 0},
+                )
+                st["guerras"] += 1
+                st["usados"] += f["usados"]
+                st["perm"] += f["perm"]
+                if "3*" in f["t1"]:
+                    st["plenos"] += 1
+                if "3*" in f["t2"]:
+                    st["plenos"] += 1
+                if f["usados"] == 0:
+                    st["ceros"] += 1
+                if "infraccion" in f["obs"].lower():
+                    st["infracciones"] += 1
+
+        lista_j = list(acum_jugadores.values())
+        if buscar_jug:
+            lista_j = [j for j in lista_j if buscar_jug in j["nick"].lower()]
+        lista_j.sort(key=lambda x: (-x["plenos"], -x["usados"], x["ceros"]))
+
+        return {
+            "total_guerras_historicas": len(guerras_hist),
+            "guerras_cols": "Fecha|Rival|Formato|Marcador|Resultado",
+            "guerras_filas": tabla_guerras,
+            "rendimiento_acumulado_cols": "Nick|TH|GuerrasConvocado|TirosUsados/Perm|Plenos3*|Veces0/2|Infracciones<5h",
+            "rendimiento_acumulado_filas": [
+                f"{j['nick']}|TH{j['th']}|{j['guerras']}G|{j['usados']}/{j['perm']}|{j['plenos']} plenos|{j['ceros']} en 0/2|{j['infracciones']} inf"
+                for j in lista_j[:35]
+            ],
+        }
+
     forzar = bool(args.get("forzar_actualizacion", False))
-    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo, forzar)
+    guerra, aviso = await _obtener_guerra_objetivo(sesion, cliente, periodo, forzar, rival_buscado)
 
     if guerra is None:
         return {"estado": "No hay guerras registradas todavía en PostgreSQL."}

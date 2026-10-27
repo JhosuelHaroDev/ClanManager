@@ -46,13 +46,14 @@ COLA_REDACTOR_ETAPA_2 = [
 HERRAMIENTAS_STACY = [
     {
         "name": "consultar_guerra_actual",
-        "description": "Consulta los datos de guerra clásica o CWL en PostgreSQL. Soporta 'actual' (en curso/preparación) y 'pasada'. Si no hay guerra activa, devuelve automáticamente la última terminada.",
+        "description": "Consulta datos de guerra en PostgreSQL: 'actual' (en curso/preparación), 'pasada' (última terminada) o 'historial' (las 6+ guerras históricas, estadísticas acumuladas de jugadores en guerra o búsqueda por nombre de clan rival).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "periodo": {"type": "string", "enum": ["actual", "pasada"]},
+                "periodo": {"type": "string", "enum": ["actual", "pasada", "historial"]},
                 "filtro": {"type": "string", "enum": ["todos", "pendientes", "infractores", "plenos", "resumen"]},
                 "nombre_jugador": {"type": "string", "description": "Opcional. Nick limpio del jugador."},
+                "rival": {"type": "string", "description": "Opcional. Nombre parcial del clan rival para buscar una guerra pasada específica."},
                 "forzar_actualizacion": {"type": "boolean"},
             },
         },

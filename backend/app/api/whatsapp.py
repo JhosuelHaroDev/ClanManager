@@ -14,6 +14,7 @@ from app.db.sesion import FabricaSesion
 from app.models.stacy import DirectorioMiembro, StacyMensajeWhatsapp
 from app.services.clash_client import ClashClient, normalizar_tag
 from app.services.stacy_ai import procesar_consulta_stacy
+from app.services.migracion_pdfs import consolidar_y_migrar_todo
 
 logger = logging.getLogger("clanmanager.whatsapp")
 
@@ -105,6 +106,17 @@ async def exportar_directorio_miembros(sesion: SesionBD) -> list[RegistroTelefon
         for f in filas
     ]
 
+@router.post("/consolidar-historial")
+async def ejecutar_consolidacion_y_migracion_pdfs(
+    sesion: SesionBD,
+    cliente: ClienteClash,
+) -> dict:
+    """
+    Ejecuta el Primer Pase de Consolidación y migra a PostgreSQL las 6 Guerras
+    Clásicas históricas y las 2 temporadas de Asaltos a la Capital de los PDFs.
+    Es 100% idempotente (no duplica registros si se ejecuta más de una vez).
+    """
+    return await consolidar_y_migrar_todo(sesion, cliente)
 
 @router.post("/vincular-webhook")
 async def configurar_webhook_green_api(url_publica_base: str) -> dict:
