@@ -1,4 +1,4 @@
-"""Programador de capturas automáticas del clan."""
+"""Programador de capturas automáticas y alertas proactivas de S.T.A.C.Y."""
 
 import logging
 from datetime import datetime, timedelta, timezone
@@ -13,20 +13,14 @@ from app.models.guerra import Guerra
 from app.services import asaltos as servicio_asaltos
 from app.services import capturas as servicio_capturas
 from app.services import guerras as servicio_guerras
+from app.services import stacy_proactiva
 from app.services.clash_client import ClashApiError, ClashClient
 
 logger = logging.getLogger("clanmanager.scheduler")
 
 
 async def capturar_periodicamente(cliente: ClashClient) -> None:
-    """
-    Tarea programada: crea una captura del clan y la guarda.
-
-    Abre su propia sesión de base de datos, porque no hay una petición
-    HTTP de la que tomarla como en los endpoints. Si la captura falla, el
-    error se registra y no se propaga, para que un fallo puntual no
-    detenga las capturas programadas siguientes.
-    """
+    """Tarea programada: crea una captura del clan y la guarda."""
     async with FabricaSesion() as sesion:
         try:
             captura = await servicio_capturas.crear_captura(sesion, cliente)
@@ -40,17 +34,15 @@ async def capturar_periodicamente(cliente: ClashClient) -> None:
     )
 
 
-async def capturar_guerra_periodicamente(cliente: ClashClient, programador: AsyncIOScheduler) -> None:
+async def capturar_guerra_periodicamente(
+    cliente: ClashClient, programador: AsyncIOScheduler
+) -> None:
     """
-    Tarea programada: decide si vale la pena sondear la guerra actual ahora
-    mismo, y si es así, la guarda o actualiza.
-
-    Si ya sabemos, por una captura anterior, que la guerra actual todavía
-    está en su día de preparación, no se hace ninguna llamada a la API:
-    nada relevante cambia durante la preparación, así que sondear en ese
-    tramo solo gastaría peticiones contra el proxy comunitario sin
-    aportar nada nuevo. En cualquier otro caso, incluido no saber nada
-    todavía, sí se sondea.
+    Sondea la guerra actual y agenda los 4 hitos proactivos de WhatsApp:
+    1. INICIO (inicio + 1 min)
+    2. CORTE_5H (inicio + 5 horas + 1 min) -> Apertura de Mapa Libre
+    3. ULTIMAS_3H (fin - 3 horas) -> Alerta roja de pendientes
+    4. FINAL (fin + 2 min) -> Cierre definitivo y resumen final
     """
     ahora = datetime.now(timezone.utc)
 
@@ -58,9 +50,11 @@ async def capturar_guerra_periodicamente(cliente: ClashClient, programador: Asyn
         ultima = await servicio_guerras.ultima_guerra_conocida(sesion)
 
     if ultima is not None and ultima.inicio is not None:
+        # Asegurar que los hitos futuros queden agendados aunque estemos en preparación
+        _programar_hitos_guerra(programador, cliente, ultima)
         if ultima.preparacion_inicio <= ahora < ultima.inicio:
             logger.debug(
-                "Guerra %s todavía en preparación, se pospone el sondeo hasta el día de batalla",
+                "Guerra %s todavía en preparación, hitos agendados hasta el día de batalla",
                 ultima.id,
             )
             return
@@ -81,48 +75,81 @@ async def capturar_guerra_periodicamente(cliente: ClashClient, programador: Asyn
         guerra.id, guerra.estado, guerra.rival_nombre, guerra.clan_estrellas, guerra.rival_estrellas,
     )
 
-    _programar_captura_final(programador, cliente, guerra)
+    _programar_hitos_guerra(programador, cliente, guerra)
 
 
-def _programar_captura_final(programador: AsyncIOScheduler, cliente: ClashClient, guerra: Guerra) -> None:
-    """
-    Agrega, si hace falta, una captura única justo después del fin de la
-    guerra, para no perder ataques de último minuto.
+def _programar_hitos_guerra(
+    programador: AsyncIOScheduler, cliente: ClashClient, guerra: Guerra
+) -> None:
+    """Agenda en APScheduler los DateTriggers futuros para la guerra actual."""
+    ahora = datetime.now(timezone.utc)
+    ts_base = f"{guerra.preparacion_inicio.timestamp():.0f}"
+    es_cwl = bool(guerra.war_tag)
 
-    id_job se deriva de la fecha de preparación de la guerra, así que
-    programarla de nuevo en un sondeo posterior, mientras la guerra siga
-    siendo la misma, actualiza la misma tarea en vez de duplicarla.
-    """
-    if guerra.fin is None:
-        return
+    # 1. Alerta de Inicio de Guerra (inicio + 1 min)
+    if guerra.inicio is not None:
+        disparo_inicio = guerra.inicio + timedelta(minutes=1)
+        if disparo_inicio > ahora:
+            programador.add_job(
+                ejecutar_hito_guerra,
+                trigger=DateTrigger(run_date=disparo_inicio),
+                args=[cliente, "INICIO"],
+                id=f"alerta_guerra_inicio_{ts_base}",
+                replace_existing=True,
+            )
+            logger.info("Alerta INICIO de guerra %s programada para %s", guerra.id, disparo_inicio)
 
-    disparo = guerra.fin + timedelta(minutes=settings.guerra_captura_final_demora_minutos)
+        # 2. Alerta de Corte de 5 Horas / Mapa Libre (solo Guerra Clásica)
+        if not es_cwl:
+            disparo_5h = guerra.inicio + timedelta(hours=5, minutes=1)
+            if disparo_5h > ahora:
+                programador.add_job(
+                    ejecutar_hito_guerra,
+                    trigger=DateTrigger(run_date=disparo_5h),
+                    args=[cliente, "CORTE_5H"],
+                    id=f"alerta_guerra_5h_{ts_base}",
+                    replace_existing=True,
+                )
+                logger.info("Alerta CORTE_5H (Mapa Libre) de guerra %s programada para %s", guerra.id, disparo_5h)
 
-    if disparo <= datetime.now(timezone.utc):
-        # El momento previsto ya pasó. Si la captura final todavía no se
-        # disparó por alguna razón, volver a programarla aquí la haría
-        # correr de inmediato, y si ya se disparó, no hay nada que hacer.
-        return
+    if guerra.fin is not None:
+        # 3. Alerta Roja de Últimas 3 Horas (fin - 3 horas)
+        disparo_3h = guerra.fin - timedelta(hours=3)
+        if disparo_3h > ahora:
+            programador.add_job(
+                ejecutar_hito_guerra,
+                trigger=DateTrigger(run_date=disparo_3h),
+                args=[cliente, "ULTIMAS_3H"],
+                id=f"alerta_guerra_3h_{ts_base}",
+                replace_existing=True,
+            )
+            logger.info("Alerta ULTIMAS_3H de guerra %s programada para %s", guerra.id, disparo_3h)
 
-    id_job = f"captura_guerra_final_{guerra.preparacion_inicio.timestamp():.0f}"
+        # 4. Captura Final + Resumen de Cierre (fin + 2 min)
+        disparo_final = guerra.fin + timedelta(
+            minutes=settings.guerra_captura_final_demora_minutos
+        )
+        if disparo_final > ahora:
+            programador.add_job(
+                capturar_guerra_una_vez,
+                trigger=DateTrigger(run_date=disparo_final),
+                args=[cliente],
+                id=f"captura_guerra_final_{ts_base}",
+                replace_existing=True,
+            )
+            logger.info("Captura y Alerta FINAL de guerra %s programada para %s", guerra.id, disparo_final)
 
-    programador.add_job(
-        capturar_guerra_una_vez,
-        trigger=DateTrigger(run_date=disparo),
-        args=[cliente],
-        id=id_job,
-        replace_existing=True,
-    )
-    logger.info("Captura final de la guerra %s programada para %s", guerra.id, disparo)
+
+async def ejecutar_hito_guerra(cliente: ClashClient, tipo_evento: str) -> None:
+    """Ejecuta el sondeo puntual y dispara el anuncio proactivo de S.T.A.C.Y. en WhatsApp."""
+    try:
+        await stacy_proactiva.disparar_alerta_guerra(cliente, tipo_evento=tipo_evento)
+    except Exception as exc:
+        logger.exception("Error ejecutando hito proactivo %s: %s", tipo_evento, exc)
 
 
 async def capturar_guerra_una_vez(cliente: ClashClient) -> None:
-    """
-    Captura de guerra sin la lógica de ahorro de capturar_guerra_periodicamente.
-
-    La usa la captura final garantizada, que debe ejecutarse sí o sí en el
-    momento programado, sin evaluar si "vale la pena".
-    """
+    """Captura final garantizada al terminar la guerra + envío del resumen de cierre a WhatsApp."""
     async with FabricaSesion() as sesion:
         try:
             guerra = await servicio_guerras.guardar_guerra_actual(sesion, cliente)
@@ -135,15 +162,11 @@ async def capturar_guerra_una_vez(cliente: ClashClient) -> None:
             "Captura final de guerra registrada: id=%s estado=%s estrellas=%s/%s",
             guerra.id, guerra.estado, guerra.clan_estrellas, guerra.rival_estrellas,
         )
+        await ejecutar_hito_guerra(cliente, "FINAL")
+
 
 async def capturar_liga_una_vez(cliente: ClashClient) -> None:
-    """
-    Tarea programada: sondea la Liga de Guerras de Clanes (CWL) actual.
-
-    Si el clan no está participando en una CWL ahora mismo, Supercell
-    responde con un error, que se trata igual que cualquier otro fallo de
-    la API: se registra y no detiene el resto de las tareas programadas.
-    """
+    """Tarea programada: sondea la Liga de Guerras de Clanes (CWL) actual."""
     async with FabricaSesion() as sesion:
         try:
             resultado = await servicio_guerras.guardar_liga_actual(sesion, cliente)
@@ -158,8 +181,8 @@ async def capturar_liga_una_vez(cliente: ClashClient) -> None:
             guerra.clan_estrellas, guerra.rival_estrellas,
         )
 
+
 def _inicio_ventana_mas_reciente(ahora: datetime) -> datetime:
-    """Calcula el inicio del Fin de Semana de Asaltos más reciente en o antes de 'ahora'."""
     dias_desde_inicio = (ahora.weekday() - settings.asalto_inicio_dia_semana) % 7
     candidato = datetime(
         ahora.year, ahora.month, ahora.day, settings.asalto_inicio_hora_utc, 0, 0, tzinfo=timezone.utc
@@ -168,36 +191,21 @@ def _inicio_ventana_mas_reciente(ahora: datetime) -> datetime:
         candidato -= timedelta(days=7)
     return candidato
 
-def _dentro_de_ventana_de_asaltos(ahora: datetime) -> bool:
-    """
-    Indica si 'ahora' cae dentro de la ventana semanal en la que puede
-    haber un Fin de Semana de Asaltos activo, con un margen extra al
-    final para alcanzar a capturar los números ya asentados.
-    """
-    inicio = _inicio_ventana_mas_reciente(ahora)
 
+def _dentro_de_ventana_de_asaltos(ahora: datetime) -> bool:
+    inicio = _inicio_ventana_mas_reciente(ahora)
     dias_duracion = (settings.asalto_fin_dia_semana - settings.asalto_inicio_dia_semana) % 7
     horas_duracion = settings.asalto_fin_hora_utc - settings.asalto_inicio_hora_utc
     duracion = timedelta(days=dias_duracion, hours=horas_duracion)
     if duracion <= timedelta():
-        # Si fin e inicio calculan una duración de cero o negativa, es que
-        # el evento dura toda la semana hasta la próxima ocurrencia.
         duracion += timedelta(days=7)
 
     fin = inicio + duracion + timedelta(minutes=settings.asalto_captura_final_demora_minutos)
     return inicio <= ahora < fin
 
-async def capturar_asalto_periodicamente(cliente: ClashClient) -> None:
-    """
-    Tarea programada: guarda o actualiza el fin de semana de asaltos más
-    reciente, solo durante la ventana semanal en la que puede haber uno
-    activo.
 
-    Fuera de esa ventana, calculada según el calendario configurado, no
-    tiene sentido sondear: no va a haber datos nuevos hasta el próximo
-    viernes, así que hacerlo solo gastaría peticiones contra el proxy
-    comunitario sin aportar nada.
-    """
+async def capturar_asalto_periodicamente(cliente: ClashClient) -> None:
+    """Tarea programada: guarda o actualiza el fin de semana de asaltos más reciente."""
     ahora = datetime.now(timezone.utc)
     if not _dentro_de_ventana_de_asaltos(ahora):
         logger.debug("Fuera de la ventana del Fin de Semana de Asaltos, se pospone el sondeo")
@@ -211,7 +219,6 @@ async def capturar_asalto_periodicamente(cliente: ClashClient) -> None:
             return
 
     if asalto is None:
-        logger.debug("Sondeo de asaltos: todavía no hay ningún fin de semana registrado")
         return
 
     logger.info(
@@ -219,12 +226,9 @@ async def capturar_asalto_periodicamente(cliente: ClashClient) -> None:
         asalto.id, asalto.estado, asalto.oro_capital_total, asalto.ataques_totales,
     )
 
-def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
-    """
-    Crea el programador con las tareas de captura ya registradas.
 
-    No lo inicia: quien lo crea decide cuándo llamar a .start() y .shutdown().
-    """
+def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
+    """Crea el programador con las tareas de captura y alertas proactivas."""
     programador = AsyncIOScheduler()
     programador.add_job(
         capturar_periodicamente,
@@ -242,7 +246,6 @@ def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
     )
-
     programador.add_job(
         capturar_liga_una_vez,
         trigger=IntervalTrigger(minutes=settings.liga_intervalo_minutos),
@@ -251,7 +254,6 @@ def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
     )
-
     programador.add_job(
         capturar_asalto_periodicamente,
         trigger=IntervalTrigger(minutes=settings.asalto_intervalo_minutos),
@@ -260,5 +262,4 @@ def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
     )
-    
     return programador

@@ -7,6 +7,8 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import BaseModel
 from sqlalchemy import select
+from typing import Literal
+from app.services.stacy_proactiva import disparar_alerta_guerra
 
 from app.api.dependencias import ClienteClash, SesionBD
 from app.config import settings
@@ -117,6 +119,22 @@ async def ejecutar_consolidacion_y_migracion_pdfs(
     Es 100% idempotente (no duplica registros si se ejecuta más de una vez).
     """
     return await consolidar_y_migrar_todo(sesion, cliente)
+
+@router.post("/probar-alerta-proactiva")
+async def disparar_alerta_manual(
+    cliente: ClienteClash,
+    tipo_evento: Literal["INICIO", "CORTE_5H", "ULTIMAS_3H", "FINAL"] = "CORTE_5H",
+    forzar_reenvio: bool = True,
+) -> dict:
+    """
+    Envía inmediatamente al grupo de WhatsApp uno de los 4 anuncios proactivos
+    de guerra de S.T.A.C.Y. ('INICIO', 'CORTE_5H', 'ULTIMAS_3H', 'FINAL').
+    """
+    return await disparar_alerta_guerra(
+        cliente=cliente,
+        tipo_evento=tipo_evento,
+        forzar_envio=forzar_reenvio,
+    )
 
 @router.post("/vincular-webhook")
 async def configurar_webhook_green_api(url_publica_base: str) -> dict:
