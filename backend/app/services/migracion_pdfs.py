@@ -603,8 +603,16 @@ async def consolidar_y_migrar_todo(
         clan_exp = cl_wl.get("expEarned") or 200
 
         if guerra_db is None:
-            guerra_db = Guerra(preparacion_inicio=dt_prep)
+            guerra_db = Guerra(
+                preparacion_inicio=dt_prep,
+                miembros=[],
+                ataques=[],
+            )
             sesion.add(guerra_db)
+        else:
+            guerra_db.miembros.clear()
+            guerra_db.ataques.clear()
+            await sesion.flush()
 
         guerra_db.estado = "warEnded"
         guerra_db.tamano_equipo = g_pdf["tamano"]
@@ -627,10 +635,6 @@ async def consolidar_y_migrar_todo(
         guerra_db.rival_nivel = rival_nivel
         guerra_db.rival_estrellas = g_pdf["rival_estrellas"]
         guerra_db.rival_destruccion = g_pdf["rival_destruccion"]
-
-        guerra_db.miembros.clear()
-        guerra_db.ataques.clear()
-        await sesion.flush()
 
         usados_propios: set[str] = set()
         mapa_propios_pos: dict[int, tuple[str, str]] = {}
