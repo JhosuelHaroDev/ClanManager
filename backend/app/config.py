@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     captura_intervalo_minutos: int = 60
     guerra_intervalo_minutos: int = 10
     guerra_captura_final_demora_minutos: int = 2
-    liga_intervalo_minutos: int = 30
+    liga_intervalo_minutos: int = 10
     asalto_intervalo_minutos: int = 1
     asalto_inicio_dia_semana: int = 4  # viernes
     asalto_inicio_hora_utc: int = 7

@@ -189,12 +189,14 @@ async def _obtener_guerra_objetivo(
     periodo: str,
     rival_buscado: str | None = None,
 ) -> tuple[Guerra | None, str | None]:
-    # Siempre sincronizar la guerra actual al último segundo desde Supercell (~0.2s)
+    # Sincronizar guerra clásica al último segundo; si devuelve None (estamos en CWL), sincronizar CWL
     if periodo == "actual" and not rival_buscado:
         try:
-            await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+            g_clasica = await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+            if g_clasica is None:
+                await servicio_guerras.guardar_liga_actual(sesion, cliente)
         except ClashApiError as exc:
-            logger.warning("Aviso al refrescar guerra en vivo: %s", exc)
+            logger.warning("Aviso al refrescar guerra/CWL en vivo: %s", exc)
 
     res = await sesion.execute(
         select(Guerra)
@@ -211,6 +213,13 @@ async def _obtener_guerra_objetivo(
         for g in ultimas:
             if r_low in g.rival_nombre.lower():
                 return g, None
+        # Permitir buscar por "ronda 1", "ronda 2", etc.
+        match_r = re.search(r"ronda\s*(\d)", r_low)
+        if match_r:
+            num_r = int(match_r.group(1))
+            for g in ultimas:
+                if g.liga_ronda == num_r:
+                    return g, None
 
     if periodo in ("pasada", "anterior"):
         terminadas = [g for g in ultimas if g.estado == "warEnded"]
@@ -218,17 +227,27 @@ async def _obtener_guerra_objetivo(
             return terminadas[0], None
         return ultimas[-1], "Mostrando la única guerra registrada en base de datos."
 
+    # En CWL coexisten la ronda actual en 'inWar' y la del día siguiente en 'preparation'.
+    # Siempre priorizar la que está en batalla ('inWar') sobre la que está en preparación.
+    en_batalla = [g for g in ultimas if g.estado == "inWar"]
+    if en_batalla:
+        return en_batalla[0], None
+
+    en_preparacion = [g for g in ultimas if g.estado == "preparation"]
+    if en_preparacion:
+        # Si solo hay rondas en preparación (Día 1 de CWL), devolver la de menor ronda (Ronda 1)
+        en_preparacion.sort(key=lambda x: x.preparacion_inicio)
+        return en_preparacion[0], None
+
     g_reciente = ultimas[0]
-    if g_reciente.estado == "warEnded":
-        return (
-            g_reciente,
-            "ATENCIÓN: El clan NO tiene guerra en curso ahora mismo. Se adjuntan los datos de la última guerra finalizada.",
-        )
-    return g_reciente, None
+    return (
+        g_reciente,
+        "ATENCIÓN: El clan NO tiene guerra en curso ahora mismo. Se adjuntan los datos de la última guerra finalizada.",
+    )
 
 
 def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[str, str]]) -> dict:
-    """Cruza miembros propios, rivales y ataques de la tabla `guerras` en PostgreSQL."""
+    """Cruza miembros propios, rivales y ataques de la tabla `guerras` (Clásica y CWL)."""
     ahora = datetime.now(timezone.utc)
     es_cwl = bool(guerra.war_tag)
     perm = guerra.ataques_por_miembro or (1 if es_cwl else 2)
@@ -236,8 +255,14 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
 
     propios = sorted([m for m in guerra.miembros if m.es_propio], key=lambda x: x.posicion_mapa)
     rivales = sorted([m for m in guerra.miembros if not m.es_propio], key=lambda x: x.posicion_mapa)
+
+    # En CWL, Supercell envía mapPosition según el roster de 48 miembros (ej. 1, 3, 4, 8...).
+    # Normalizamos de 1 a N (1..15 o 1..30) para que coincida exactamente con el mapa dentro del juego.
+    pos_juego_propio = {p.tag: idx for idx, p in enumerate(propios, start=1)}
+    pos_juego_rival = {r.tag: idx for idx, r in enumerate(rivales, start=1)}
+
     riv_por_tag = {r.tag: r for r in rivales}
-    riv_por_pos = {r.posicion_mapa: r for r in rivales}
+    riv_por_pos = {idx: r for idx, r in enumerate(rivales, start=1)}
     prop_por_tag = {p.tag: p for p in propios}
 
     nuestros_ataques = sorted(
@@ -265,13 +290,12 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
 
     filas = []
     for p in propios:
-        pos = p.posicion_mapa
+        pos = pos_juego_propio[p.tag]
         mis_tiros = [a for a in nuestros_ataques if a.atacante_tag == p.tag]
         usados = len(mis_tiros)
 
         def fmt_tiro(atk) -> str:
-            def_riv = riv_por_tag.get(atk.defensor_tag)
-            pos_d = f"#{def_riv.posicion_mapa}" if def_riv else "?"
+            pos_d = f"#{pos_juego_rival[atk.defensor_tag]}" if atk.defensor_tag in pos_juego_rival else "?"
             return f"({pos_d}){atk.destruccion:.0f}% {atk.estrellas}*"
 
         t1_txt = fmt_tiro(mis_tiros[0]) if usados >= 1 else "-"
@@ -290,14 +314,19 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
             est_riv_txt = f"{best_riv[1]:.0f}% {best_riv[0]}* (Abierta)"
 
         infracciones = []
-        if not es_cwl:
+        if es_cwl:
+            # En CWL: 24 horas ataque exclusivo a espejo (1/1), salvo acuerdo en el Grafo de Memoria
+            for atk in mis_tiros:
+                def_pos = pos_juego_rival.get(atk.defensor_tag, 0)
+                dueno_espejo = propios[def_pos - 1].nombre.lower() if 1 <= def_pos <= len(propios) else ""
+                par_nombres = (p.nombre.lower(), dueno_espejo)
+                if def_pos != pos and par_nombres not in cambios_autorizados:
+                    infracciones.append(f"Infraccion CWL: Ataco #{def_pos} ignorando su espejo #{pos}")
+        else:
             for idx_t, atk in enumerate(mis_tiros):
-                def_riv = riv_por_tag.get(atk.defensor_tag)
-                def_pos = def_riv.posicion_mapa if def_riv else 0
-                par_nombres = (
-                    p.nombre.lower(),
-                    (riv_por_pos.get(def_pos).nombre.lower() if riv_por_pos.get(def_pos) else ""),
-                )
+                def_pos = pos_juego_rival.get(atk.defensor_tag, 0)
+                dueno_espejo = propios[def_pos - 1].nombre.lower() if 1 <= def_pos <= len(propios) else ""
+                par_nombres = (p.nombre.lower(), dueno_espejo)
                 if atk.orden <= max_order_5h and def_pos != pos and par_nombres not in cambios_autorizados:
                     if idx_t == 0:
                         infracciones.append(f"Infraccion(<5h): Ataco #{def_pos} ignorando espejo #{pos}")
@@ -312,7 +341,10 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
             obs = f"Dejo 1 tiro colgado (1/{perm})" if guerra.estado == "warEnded" else f"Falta 2do tiro (1/{perm})"
         else:
             stars_tot = sum(a.estrellas for a in mis_tiros)
-            obs = "Doble Pleno (6*)" if stars_tot == perm * 3 else f"Cumplio ({stars_tot}*)"
+            if es_cwl:
+                obs = "Pleno CWL (3*)" if stars_tot == 3 else f"Cumplio ({stars_tot}*)"
+            else:
+                obs = "Doble Pleno (6*)" if stars_tot == perm * 3 else f"Cumplio ({stars_tot}*)"
 
         filas.append({
             "pos": pos,
@@ -337,7 +369,9 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
         fase_txt = f"Dia Preparacion (Inicia en {rest_m // 60}h {rest_m % 60}m)"
     elif guerra.fin:
         rest_m = max(0, int((guerra.fin - ahora).total_seconds() // 60))
-        if not es_cwl and guerra.inicio and ahora <= guerra.inicio + timedelta(hours=5):
+        if es_cwl:
+            fase_txt = f"CWL Regla Solo Espejo 24h ({rest_m // 60}h {rest_m % 60}m rest)"
+        elif guerra.inicio and ahora <= guerra.inicio + timedelta(hours=5):
             esp_m = max(0, int(((guerra.inicio + timedelta(hours=5)) - ahora).total_seconds() // 60))
             fase_txt = f"Regla Solo Espejo ({esp_m // 60}h {esp_m % 60}m rest)"
         else:
@@ -359,17 +393,17 @@ def _reconstruir_estado_guerra(guerra: Guerra, cambios_autorizados: set[tuple[st
     nuestros_plenos = sum(1 for a in nuestros_ataques if a.estrellas == 3)
     rivales_plenos = sum(1 for a in ataques_rivales if a.estrellas == 3)
     max_tiros = tamano * perm
+    etiqueta_modo = f"CWL Ronda {guerra.liga_ronda} ({guerra.liga_temporada})" if es_cwl else "Clasica"
 
     resumen_marcador = (
         f"{guerra.clan_nombre} [{guerra.clan_estrellas}/{tamano*3}* ({guerra.clan_destruccion:.2f}%) | "
         f"Tiros: {len(nuestros_ataques)}/{max_tiros} | Plenos: {nuestros_plenos}] vs "
         f"{guerra.rival_nombre} [{guerra.rival_estrellas}/{tamano*3}* ({guerra.rival_destruccion:.2f}%) | "
         f"Tiros: {len(ataques_rivales)}/{max_tiros} | Plenos: {rivales_plenos}] | "
-        f"Resultado: {res_global} ({guerra.estado}) | {tamano}v{tamano} {'CWL' if es_cwl else 'Clasica'} | {fase_txt}"
+        f"Resultado: {res_global} ({guerra.estado}) | {tamano}v{tamano} {etiqueta_modo} | {fase_txt}"
     )
 
     return {"marcador": resumen_marcador, "fase": fase_txt, "filas": filas}
-
 
 async def _tool_consultar_guerra_actual(
     args: dict, sesion: AsyncSession, cliente: ClashClient

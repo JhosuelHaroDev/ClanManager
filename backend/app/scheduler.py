@@ -81,36 +81,36 @@ async def capturar_guerra_periodicamente(
 def _programar_hitos_guerra(
     programador: AsyncIOScheduler, cliente: ClashClient, guerra: Guerra
 ) -> None:
-    """Agenda en APScheduler los DateTriggers futuros para la guerra actual."""
+    """Agenda en APScheduler los DateTriggers futuros para la guerra clásica o ronda de CWL."""
     ahora = datetime.now(timezone.utc)
-    ts_base = f"{guerra.preparacion_inicio.timestamp():.0f}"
     es_cwl = bool(guerra.war_tag)
+    sufijo = f"cwl_r{guerra.liga_ronda}_{guerra.id}" if es_cwl else f"war_{guerra.preparacion_inicio.timestamp():.0f}"
 
-    # 1. Alerta de Inicio de Guerra (inicio + 1 min)
+    # 1. Alerta de Inicio de Guerra / Ronda (inicio + 1 min)
     if guerra.inicio is not None:
         disparo_inicio = guerra.inicio + timedelta(minutes=1)
         if disparo_inicio > ahora:
             programador.add_job(
                 ejecutar_hito_guerra,
                 trigger=DateTrigger(run_date=disparo_inicio),
-                args=[cliente, "INICIO"],
-                id=f"alerta_guerra_inicio_{ts_base}",
+                args=[cliente, "INICIO", guerra.id],
+                id=f"alerta_guerra_inicio_{sufijo}",
                 replace_existing=True,
             )
-            logger.info("Alerta INICIO de guerra %s programada para %s", guerra.id, disparo_inicio)
+            logger.info("Alerta INICIO programada para guerra_id=%s (ronda=%s) en %s", guerra.id, guerra.liga_ronda, disparo_inicio)
 
-        # 2. Alerta de Corte de 5 Horas / Mapa Libre (solo Guerra Clásica)
+        # 2. Alerta de Corte de 5 Horas / Mapa Libre (solo Guerra Clásica; en CWL son 24h de espejo)
         if not es_cwl:
             disparo_5h = guerra.inicio + timedelta(hours=5, minutes=1)
             if disparo_5h > ahora:
                 programador.add_job(
                     ejecutar_hito_guerra,
                     trigger=DateTrigger(run_date=disparo_5h),
-                    args=[cliente, "CORTE_5H"],
-                    id=f"alerta_guerra_5h_{ts_base}",
+                    args=[cliente, "CORTE_5H", guerra.id],
+                    id=f"alerta_guerra_5h_{sufijo}",
                     replace_existing=True,
                 )
-                logger.info("Alerta CORTE_5H (Mapa Libre) de guerra %s programada para %s", guerra.id, disparo_5h)
+                logger.info("Alerta CORTE_5H programada para guerra_id=%s en %s", guerra.id, disparo_5h)
 
     if guerra.fin is not None:
         # 3. Alerta Roja de Últimas 3 Horas (fin - 3 horas)
@@ -119,11 +119,11 @@ def _programar_hitos_guerra(
             programador.add_job(
                 ejecutar_hito_guerra,
                 trigger=DateTrigger(run_date=disparo_3h),
-                args=[cliente, "ULTIMAS_3H"],
-                id=f"alerta_guerra_3h_{ts_base}",
+                args=[cliente, "ULTIMAS_3H", guerra.id],
+                id=f"alerta_guerra_3h_{sufijo}",
                 replace_existing=True,
             )
-            logger.info("Alerta ULTIMAS_3H de guerra %s programada para %s", guerra.id, disparo_3h)
+            logger.info("Alerta ULTIMAS_3H programada para guerra_id=%s (ronda=%s) en %s", guerra.id, guerra.liga_ronda, disparo_3h)
 
         # 4. Captura Final + Resumen de Cierre (fin + 2 min)
         disparo_final = guerra.fin + timedelta(
@@ -133,39 +133,60 @@ def _programar_hitos_guerra(
             programador.add_job(
                 capturar_guerra_una_vez,
                 trigger=DateTrigger(run_date=disparo_final),
-                args=[cliente],
-                id=f"captura_guerra_final_{ts_base}",
+                args=[cliente, guerra.id],
+                id=f"captura_guerra_final_{sufijo}",
                 replace_existing=True,
             )
-            logger.info("Captura y Alerta FINAL de guerra %s programada para %s", guerra.id, disparo_final)
+            logger.info("Captura y Alerta FINAL programada para guerra_id=%s (ronda=%s) en %s", guerra.id, guerra.liga_ronda, disparo_final)
 
 
-async def ejecutar_hito_guerra(cliente: ClashClient, tipo_evento: str) -> None:
+async def ejecutar_hito_guerra(
+    cliente: ClashClient, tipo_evento: str, guerra_id: int | None = None
+) -> None:
     """Ejecuta el sondeo puntual y dispara el anuncio proactivo de S.T.A.C.Y. en WhatsApp."""
     try:
-        await stacy_proactiva.disparar_alerta_guerra(cliente, tipo_evento=tipo_evento)
+        await stacy_proactiva.disparar_alerta_guerra(
+            cliente, tipo_evento=tipo_evento, guerra_id=guerra_id
+        )
     except Exception as exc:
-        logger.exception("Error ejecutando hito proactivo %s: %s", tipo_evento, exc)
+        logger.exception("Error ejecutando hito proactivo %s (guerra_id=%s): %s", tipo_evento, guerra_id, exc)
 
 
-async def capturar_guerra_una_vez(cliente: ClashClient) -> None:
-    """Captura final garantizada al terminar la guerra + envío del resumen de cierre a WhatsApp."""
+async def capturar_guerra_una_vez(
+    cliente: ClashClient, guerra_id: int | None = None
+) -> None:
+    """Captura final garantizada al terminar la guerra o ronda de CWL + envío del resumen de cierre."""
     async with FabricaSesion() as sesion:
         try:
             guerra = await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+            if guerra is None:
+                await servicio_guerras.guardar_liga_actual(sesion, cliente)
         except ClashApiError as error:
-            logger.error("Falló la captura final de guerra: %s", error)
+            logger.error("Falló la captura final de guerra/CWL: %s", error)
             return
 
-    if guerra is not None:
+    await ejecutar_hito_guerra(cliente, "FINAL", guerra_id=guerra_id)
+
+
+async def capturar_liga_una_vez(
+    cliente: ClashClient, programador: AsyncIOScheduler | None = None
+) -> None:
+    """Tarea programada: sondea la CWL actual y agenda las alertas proactivas de cada ronda."""
+    async with FabricaSesion() as sesion:
+        try:
+            resultado = await servicio_guerras.guardar_liga_actual(sesion, cliente)
+        except ClashApiError as error:
+            logger.debug("Sin Liga de Guerras de Clanes activa o falló el sondeo: %s", error)
+            return
+
+    for guerra in resultado.guerras_propias:
         logger.info(
-            "Captura final de guerra registrada: id=%s estado=%s estrellas=%s/%s",
-            guerra.id, guerra.estado, guerra.clan_estrellas, guerra.rival_estrellas,
+            "Guerra de CWL actualizada: ronda=%s id=%s estado=%s rival=%s estrellas=%s/%s",
+            guerra.liga_ronda, guerra.id, guerra.estado, guerra.rival_nombre,
+            guerra.clan_estrellas, guerra.rival_estrellas,
         )
-        await ejecutar_hito_guerra(cliente, "FINAL")
-
-
-async def capturar_liga_una_vez(cliente: ClashClient) -> None:
+        if programador is not None:
+            _programar_hitos_guerra(programador, cliente, guerra)
     """Tarea programada: sondea la Liga de Guerras de Clanes (CWL) actual."""
     async with FabricaSesion() as sesion:
         try:
@@ -256,7 +277,7 @@ def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:
     programador.add_job(
         capturar_liga_una_vez,
         trigger=IntervalTrigger(minutes=settings.liga_intervalo_minutos),
-        args=[cliente],
+        args=[cliente, programador],
         id="captura_liga_periodica",
         coalesce=True,
         max_instances=1,

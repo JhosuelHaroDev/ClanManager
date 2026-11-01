@@ -63,11 +63,11 @@ async def disparar_alerta_guerra(
     cliente: ClashClient,
     tipo_evento: str,
     forzar_envio: bool = False,
+    guerra_id: int | None = None,
 ) -> dict:
     """
-    Sondea la guerra en vivo, verifica que el aviso no se haya enviado antes
-    y publica el reporte proactivo de S.T.A.C.Y. en el grupo de WhatsApp.
-    tipos soportados: 'INICIO' | 'CORTE_5H' | 'ULTIMAS_3H' | 'FINAL'
+    Sondea la guerra clásica o CWL en vivo, selecciona la guerra/ronda exacta y publica
+    el reporte proactivo de S.T.A.C.Y. en el grupo oficial de WhatsApp.
     """
     chat_id = _obtener_chat_id_principal()
     if not chat_id:
@@ -75,19 +75,34 @@ async def disparar_alerta_guerra(
 
     async with FabricaSesion() as sesion:
         try:
-            await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+            g_clasica = await servicio_guerras.guardar_guerra_actual(sesion, cliente)
+            if g_clasica is None:
+                await servicio_guerras.guardar_liga_actual(sesion, cliente)
         except ClashApiError as exc:
-            logger.warning("No se pudo refrescar guerra antes de alerta %s: %s", tipo_evento, exc)
+            logger.warning("No se pudo refrescar guerra/CWL antes de alerta %s: %s", tipo_evento, exc)
 
-        res = await sesion.execute(
-            select(Guerra)
-            .order_by(Guerra.preparacion_inicio.desc())
-            .limit(1)
-            .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
-        )
-        guerra = res.scalar_one_or_none()
+        guerra: Guerra | None = None
+        if guerra_id is not None:
+            res_id = await sesion.execute(
+                select(Guerra)
+                .where(Guerra.id == guerra_id)
+                .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
+            )
+            guerra = res_id.scalar_one_or_none()
+
         if guerra is None:
-            return {"enviado": False, "motivo": "No hay guerra registrada en PostgreSQL."}
+            res = await sesion.execute(
+                select(Guerra)
+                .order_by(Guerra.preparacion_inicio.desc())
+                .limit(5)
+                .options(selectinload(Guerra.miembros), selectinload(Guerra.ataques))
+            )
+            candidatas = list(res.scalars().all())
+            if not candidatas:
+                return {"enviado": False, "motivo": "No hay guerra registrada en PostgreSQL."}
+            # En CWL hay una ronda en 'inWar' y la siguiente en 'preparation': priorizar 'inWar'
+            en_batalla = [g for g in candidatas if g.estado == "inWar"]
+            guerra = en_batalla[0] if en_batalla else candidatas[0]
 
         id_alerta = f"PROACTIVO_WAR_{guerra.id}_{tipo_evento}"
         if not forzar_envio:
@@ -201,34 +216,36 @@ def _extraer_resumen_para_alerta(paquete: dict, guerra: Guerra) -> dict:
 
 def _construir_instruccion_evento(tipo_evento: str, guerra: Guerra) -> str:
     es_cwl = bool(guerra.war_tag)
+    etiqueta_cwl = f"la Ronda {guerra.liga_ronda} de CWL" if es_cwl else "la guerra"
+
     if tipo_evento == "INICIO":
         if es_cwl:
             return (
-                f"¡Acaba de iniciar el Día de Batalla de CWL contra '{guerra.rival_nombre}'! "
-                "Anuncia que tenemos 24 horas y recuerda que en CWL el único tiro (1/1) es OBLIGATORIAMENTE a su espejo (# contra #)."
+                f"¡Acaba de iniciar el Día de Batalla de {etiqueta_cwl} contra '{guerra.rival_nombre}' "
+                f"({guerra.tamano_equipo}v{guerra.tamano_equipo})! "
+                "Anuncia que tenemos 24 horas y recuerda que en CWL el único ataque (1/1) es OBLIGATORIAMENTE "
+                "a su espejo (# contra #) durante las 24 horas, salvo cambio autorizado."
             )
         return (
             f"¡Acaba de iniciar el Día de Batalla contra '{guerra.rival_nombre}' ({guerra.tamano_equipo}v{guerra.tamano_equipo})! "
-            "Anuncia que se abren las PRIMERAS 5 HORAS de ataque exclusivo a espejo (# contra #) con el 1.er tiro. "
-            "Advierte con humor que nadie robe espejos ajenos ni gaste su 2.º tiro antes de las 5 horas."
+            "Anuncia que se abren las PRIMERAS 5 HORAS de ataque exclusivo a espejo (# contra #) con el 1.er tiro."
         )
     if tipo_evento == "CORTE_5H":
         return (
             f"¡Se cumplieron las primeras 5 horas de batalla contra '{guerra.rival_nombre}'! "
-            "Anuncia oficialmente que TERMINÓ EL BLOQUEO DE ESPEJOS y SE ABRE EL MAPA LIBRE para limpieza de 3⭐ y segundos tiros. "
-            "Muestra el marcador actual, felicita a los que ya aseguraron su espejo con 3⭐, exhibe con sarcasmo si hubo algún infractor "
-            "que se adelantó antes de las 5h, y menciona cuántas bases rivales quedan abiertas."
+            "Anuncia oficialmente que TERMINÓ EL BLOQUEO DE ESPEJOS y SE ABRE EL MAPA LIBRE."
         )
     if tipo_evento == "ULTIMAS_3H":
+        tiros_txt = "0/1" if es_cwl else "0/2 o 1/2"
         return (
-            f"¡ALERTA ROJA: Quedan menos de 3 HORAS para que termine la guerra contra '{guerra.rival_nombre}'! "
-            "Muestra el marcador, pasa lista nominal de los miembros que siguen en 0/2 (pregúntales con ironía si firmaron un tratado de paz) "
-            "y de los que están en 1/2 para que entren a rematar las bases abiertas ya mismo."
+            f"¡ALERTA ROJA: Quedan menos de 3 HORAS para que termine {etiqueta_cwl} contra '{guerra.rival_nombre}'! "
+            f"Muestra el marcador y pasa lista nominal de los miembros que siguen sin atacar ({tiros_txt}) "
+            "para que entren a cumplir su ataque de inmediato."
         )
     return (
-        f"¡LA GUERRA CONTRA '{guerra.rival_nombre}' HA FINALIZADO! "
-        "Presenta el informe ejecutivo de cierre: veredicto final del marcador, elogio a los Cracks que hicieron Doble Pleno (6⭐), "
-        "reporte de infractores de la regla de las 5h y lista de quienes dejaron tiros colgados sin usar (0/2 o 1/2) para auditoría del Alto Mando."
+        f"¡{etiqueta_cwl.upper()} CONTRA '{guerra.rival_nombre}' HA FINALIZADO! "
+        "Presenta el informe ejecutivo de cierre: veredicto final del marcador, elogio a quienes lograron pleno (3⭐), "
+        "reporte de infractores de espejo y lista de quienes dejaron su tiro sin usar."
     )
 
 
