@@ -25,7 +25,7 @@ _ULTIMO_CAMBIO_DETECTADO_UTC: datetime | None = None
 
 
 def hay_posible_timeout_pendiente(ahora_utc: datetime) -> bool:
-    """Indica si transcurrieron >= 15 min desde el último golpe para revisar el Gatillo C."""
+    """Indica si transcurrieron >= 15 min desde el último golpe para revisar abandonos."""
     if _ULTIMO_CAMBIO_DETECTADO_UTC is None:
         return False
     minutos = (ahora_utc - _ULTIMO_CAMBIO_DETECTADO_UTC).total_seconds() / 60.0
@@ -105,8 +105,6 @@ async def _guardar_desde_raw_preservando_timestamps(
     )
     asalto = resultado.scalar_one_or_none()
 
-    # Clave inmune al desplazamiento cuando se abre un nuevo clan rival:
-    # (sentido, clan_tag, clan_nombre, distrito_id_juego, atacante_tag, destruccion)
     memoria_timestamps: dict[tuple, tuple[datetime, int]] = {}
     max_orden_previo = 0
 
@@ -162,11 +160,11 @@ async def _guardar_desde_raw_preservando_timestamps(
 
     siguiente_orden = max_orden_previo + 1
 
-    # Importante: En Supercell attackLog[0] es la incursión más reciente y attackLog[-1] la más antigua.
-    # Insertamos de la más antigua a la más reciente para que registro.id crezca siempre en orden cronológico.
+    # Supercell entrega ataques_realizados en orden cronológico natural (Incursión #1 -> Incursión actual).
+    # Se guarda directamente sin invertir para que registro.id respete la secuencia histórica real.
     for sentido, lista in (
-        ("ofensivo", list(reversed(asalto_actual.ataques_realizados))),
-        ("defensivo", list(reversed(asalto_actual.ataques_recibidos))),
+        ("ofensivo", asalto_actual.ataques_realizados),
+        ("defensivo", asalto_actual.ataques_recibidos),
     ):
         for registro_datos in lista:
             fila_reg, siguiente_orden = _construir_registro(
@@ -257,14 +255,14 @@ def _construir_registro(
 
 
 # =============================================================================
-# MOTOR FORENSE DE AUDITORÍA DE CAPITAL (CALIBRADO CON ORDEN CRONOLÓGICO REAL)
+# MOTOR FORENSE DE AUDITORÍA DE CAPITAL (CALIBRADO + NOMENCLATURA CLARA)
 # =============================================================================
 def _ordenar_incursiones_cronologicamente(registros_ofensivos: list[AsaltoRegistro]) -> list[AsaltoRegistro]:
     """
-    Ordena las incursiones desde la más antigua hasta la más reciente (en curso):
-    1. Si una incursión está incompleta (`distritos_destruidos < distritos_totales`), va siempre al final.
-    2. Si tienen `orden_aparicion > 0` o timestamps diferenciados, usa su marca de tiempo.
-    3. Respaldo por `id` de base de datos ascendente.
+    Ordena las incursiones desde la #1 (más antigua) hasta la actual (en curso):
+    1. La incursión aún abierta (`distritos_destruidos < distritos_totales`) va siempre al final.
+    2. Si tienen `orden_aparicion > 0`, usa el orden en que se detectaron en vivo.
+    3. Para las incursiones previas sin `orden_aparicion`, mantiene el orden natural (`reg.id` ascendente).
     """
     def clave_incursion(reg: AsaltoRegistro) -> tuple:
         en_curso = 1 if reg.distritos_destruidos < reg.distritos_totales else 0
@@ -283,8 +281,8 @@ def _ordenar_incursiones_cronologicamente(registros_ofensivos: list[AsaltoRegist
 
 def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
     """
-    Reconstruye la cronología real de los ataques de cada jugador y evalúa los Gatillos A, B y C
-    sin falsos positivos por inversión de incursiones o de distritos dentro del mismo clan.
+    Reconstruye la cronología real de los ataques de cada jugador y evalúa las reglas
+    de remate usando nombres claros para el clan y formato compacto para móvil.
     """
     ahora_utc = datetime.now(timezone.utc)
     registros_ofensivos = _ordenar_incursiones_cronologicamente(
@@ -292,10 +290,8 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
     )
     mapa_miembros = {m.tag: m for m in asalto.miembros}
 
-    # 1. Extraer todos los golpes por distrito e incursión
     golpes_todos: list[dict] = []
     for idx_incursion, reg in enumerate(registros_ofensivos, start=1):
-        # Ordenar los distritos dentro de la incursión por su primer orden_aparicion si existe
         distritos_ordenados = sorted(
             reg.distritos,
             key=lambda d: (
@@ -317,17 +313,15 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
                 )
                 ts_utc = atk.detectado_en or asalto.ultima_actualizacion_en or ahora_utc
                 if antes == 0 and despues == 100:
-                    hito_base = "ONE_SHOT(100%)"
+                    hito_base = "Pleno de 1 tiro (100%)"
                 elif despues == 100:
-                    hito_base = "REMATE_BONUS(100%)"
-                elif 90 <= despues < 100:
-                    hito_base = f"DEJADO_AL_{despues}%"
-                elif 70 <= despues < 90:
-                    hito_base = f"ABIERTO_{despues}%"
+                    hito_base = "Remate final (100%)"
+                elif 70 <= despues < 100:
+                    hito_base = f"Sin rematar ({despues}%)"
                 elif antes == 0:
-                    hito_base = "APERTURA"
+                    hito_base = "Apertura"
                 else:
-                    hito_base = "PROGRESO"
+                    hito_base = "Avance"
 
                 golpes_todos.append({
                     "incursion_num": idx_incursion,
@@ -353,7 +347,6 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
                 })
                 acum_pct = despues
 
-    # Numerar correlativo de bitácora (#1 = más reciente, #N = más antiguo)
     total_golpes = len(golpes_todos)
     for i, g in enumerate(golpes_todos):
         g["num_bitacora"] = total_golpes - i
@@ -376,12 +369,6 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
         limite_base = info_m.limite_ataques if info_m else 5
         max_permitidos_final = limite_base + bono_oficial
 
-        # Ordenar los golpes del jugador respetando:
-        # 1) Si tienen orden_aparicion > 0 (capturados minuto a minuto), usa orden_aparicion.
-        # 2) Incursión cronológica (incursion_num ascendente).
-        # 3) Dentro de la MISMA incursión sin orden_aparicion vivo (orden_aparicion == 0):
-        #    los distritos donde el jugador logró 100% van ANTES que el distrito inconcluso (<100%),
-        #    evitando invertir apertura+remate con el último distrito donde se quedó sin tiros.
         max_pct_por_distrito: dict[str, int] = {}
         min_orden_por_distrito: dict[str, int] = {}
         for g in lista_bruta:
@@ -395,7 +382,6 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
             d_uid = g["distrito_id_unico"]
             ord_vivo = min_orden_por_distrito.get(d_uid, 0)
             tiene_vivo = 1 if ord_vivo > 0 else 0
-            # Si no tiene timestamp vivo dentro de la misma incursión, primero van los distritos cerrados al 100%
             fue_incompleto_sin_ts = (
                 1 if (ord_vivo == 0 and max_pct_por_distrito.get(d_uid, 0) < 100) else 0
             )
@@ -420,50 +406,46 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
             g["tiro_personal_txt"] = f"{idx_tiro}/{max_permitidos_final}"
             g["tiros_restantes_despues"] = restantes
 
-        # Agrupar distritos tocados en el orden real de los tiros del jugador
         distritos_tocados_orden: list[str] = []
         for g in mis_golpes:
             if g["distrito_id_unico"] not in distritos_tocados_orden:
                 distritos_tocados_orden.append(g["distrito_id_unico"])
 
         distritos_sin_rematar: list[dict] = []
-        todos_distritos_abiertos: list[dict] = []
+        distritos_abiertos_relevantes: list[dict] = []
         infracciones_jugador: list[dict] = []
 
-        for idx_dist_jug, d_uid in enumerate(distritos_tocados_orden):
+        for d_uid in distritos_tocados_orden:
             todos_en_d = golpes_por_distrito[d_uid]
             mis_en_d = [x for x in mis_golpes if x["distrito_id_unico"] == d_uid]
             ultimo_mio = mis_en_d[-1]
 
             if ultimo_mio["despues_pct"] < 100:
-                # Golpes de compañeros en ese distrito posteriores al último golpe de este jugador
                 posteriores_ajenos = [
                     x for x in todos_en_d
                     if x["despues_pct"] > ultimo_mio["despues_pct"] and x["atacante_tag"] != tag_jug
                 ]
                 limpieza_ajena_txt = None
+                limpieza_corta_movil = None
                 cerrado_de_un_solo_tiro_ajeno = False
                 if posteriores_ajenos:
                     rem = posteriores_ajenos[0]
                     if rem["despues_pct"] == 100:
                         cerrado_de_un_solo_tiro_ajeno = True
                     limpieza_ajena_txt = (
-                        f"{rem['atacante_nombre']} (Golpe #{rem['num_bitacora']}, "
-                        f"{rem['antes_pct']}%->{rem['despues_pct']}%, {rem['oro_estimado']} oro)"
+                        f"{rem['atacante_nombre']} ({rem['antes_pct']}%->{rem['despues_pct']}%, {rem['oro_estimado']} oro)"
                     )
-                    ultimo_mio["limpieza_ajena_detalle"] = limpieza_ajena_txt
+                    limpieza_corta_movil = (
+                        f"Lo cerró {rem['atacante_nombre']} (+{rem['aporte_pct']}%, {rem['oro_estimado']} oro)"
+                    )
+                    ultimo_mio["limpieza_ajena_detalle"] = limpieza_corta_movil
 
-                # ¿El jugador hizo ataques posteriores en un distrito diferente?
                 mis_posteriores_otro_dist = [
                     x for x in mis_golpes
                     if x["tiro_personal_num"] > ultimo_mio["tiro_personal_num"]
                     and x["distrito_id_unico"] != d_uid
                 ]
 
-                # ¿Estaba en franja de remate ("sin rematar")?
-                # Se considera "dejado sin rematar" cuando:
-                # - Quedó en >= 70% (a tiro de remate), O
-                # - El jugador le dio >= 2 golpes dejándolo >= 65% y otro compañero lo cerró de 1 solo golpe.
                 es_franja_remate = (
                     ultimo_mio["despues_pct"] >= 70
                     or (len(mis_en_d) >= 2 and ultimo_mio["despues_pct"] >= 65 and cerrado_de_un_solo_tiro_ajeno)
@@ -485,12 +467,14 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
                         else None
                     ),
                 }
-                todos_distritos_abiertos.append(reg_abierto)
+
+                # Se contabiliza como distrito abierto relevante si quedó >= 50% o le dio >= 2 golpes
+                if ultimo_mio["despues_pct"] >= 50 or len(mis_en_d) >= 2:
+                    distritos_abiertos_relevantes.append(reg_abierto)
                 if es_franja_remate:
                     distritos_sin_rematar.append(reg_abierto)
 
-                # GATILLO A: Tenía ataques disponibles, dejó el distrito en franja de remate (>=70%)
-                # y se fugó a atacar otro distrito distinto
+                # REGLA 1: Abandono de distrito en franja de remate (>=70%) teniendo ataques disponibles
                 if (
                     es_franja_remate
                     and ultimo_mio["tiros_restantes_despues"] > 0
@@ -498,23 +482,20 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
                 ):
                     sig = mis_posteriores_otro_dist[0]
                     infracciones_jugador.append({
-                        "codigo": "GATILLO_A_FUGA_DISTRITO",
-                        "gravedad": "GRAVE",
+                        "regla_vulnerada": "Abandono de distrito con ataques disponibles",
+                        "gravedad": "Falta Grave",
                         "explicacion": (
-                            f"En su Tiro {ultimo_mio['tiro_personal_txt']} (Golpe #{ultimo_mio['num_bitacora']}) "
-                            f"dejó '{ultimo_mio['distrito_etiqueta']}' sin rematar al {ultimo_mio['despues_pct']}% "
-                            f"quedándole {ultimo_mio['tiros_restantes_despues']} ataque(s) disponible(s), y se fue a atacar "
-                            f"'{sig['distrito_etiqueta']}'"
-                            + (f", obligando a {limpieza_ajena_txt} a rematarlo." if limpieza_ajena_txt else ".")
+                            f"En su Tiro {ultimo_mio['tiro_personal_txt']} dejó '{ultimo_mio['distrito_etiqueta']}' "
+                            f"al {ultimo_mio['despues_pct']}% quedándole {ultimo_mio['tiros_restantes_despues']} "
+                            f"ataque(s) libre(s), y saltó a '{sig['distrito_etiqueta']}'"
+                            + (f" (lo tuvo que cerrar {limpieza_ajena_txt})." if limpieza_ajena_txt else ".")
                         ),
                     })
                     ultimo_mio["alerta_forense"] = (
-                        f"🚨 INFRACCIÓN (GATILLO A): Abandonado al {ultimo_mio['despues_pct']}% "
-                        f"quedándole {ultimo_mio['tiros_restantes_despues']} tiro(s)"
+                        f"🚨 Abandonado al {ultimo_mio['despues_pct']}% (quedaban {ultimo_mio['tiros_restantes_despues']} tiros)"
                     )
 
-                # GATILLO C: Tenía ataques disponibles, dejó el distrito en >=80% y no gastó todos sus tiros
-                # (otro compañero lo limpió o pasaron >=15 min de desconexión)
+                # REGLA 3: Dejar distrito en >=80% con ataques disponibles sin usarlos
                 elif (
                     ultimo_mio["tiros_restantes_despues"] > 0
                     and ultimo_mio["despues_pct"] >= 80
@@ -523,76 +504,74 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
                     minutos_transcurridos = (ahora_utc - ultimo_mio["detectado_en"]).total_seconds() / 60.0
                     if limpieza_ajena_txt or minutos_transcurridos >= 15.0:
                         infracciones_jugador.append({
-                            "codigo": "GATILLO_C_ABANDONO_CON_TIROS",
-                            "gravedad": "GRAVE",
+                            "regla_vulnerada": "Distrito dejado a medias con ataques sin usar",
+                            "gravedad": "Falta Grave",
                             "explicacion": (
                                 f"En su Tiro {ultimo_mio['tiro_personal_txt']} dejó '{ultimo_mio['distrito_etiqueta']}' "
                                 f"al {ultimo_mio['despues_pct']}% quedándole {ultimo_mio['tiros_restantes_despues']} "
-                                f"ataque(s) sin usar."
+                                f"ataque(s) sin gastar."
                             ),
                         })
                         ultimo_mio["alerta_forense"] = (
-                            f"🚨 INFRACCIÓN (GATILLO C): Dejado al {ultimo_mio['despues_pct']}% con tiros sin usar"
+                            f"🚨 Dejado al {ultimo_mio['despues_pct']}% con tiros pendientes"
                         )
 
-        # GATILLO B: Dejó 2 distritos en franja de remate (>=70%), o 1 en franja de remate + otro distrito
-        # inconcluso adicional habiendo abandonado el de franja de remate
-        tiene_doble_remate = len(distritos_sin_rematar) >= 2 or (
+        # REGLA 2: Doble distrito sin rematar (al menos 1 en franja de remate >=70% y otro >=50% con tiros libres previos)
+        tiene_doble_infraccion = len(distritos_sin_rematar) >= 2 or (
             len(distritos_sin_rematar) == 1
-            and len(todos_distritos_abiertos) >= 2
-            and any(c["codigo"] == "GATILLO_A_FUGA_DISTRITO" for c in infracciones_jugador)
+            and len(distritos_abiertos_relevantes) >= 2
+            and any(d["restantes_en_ese_momento"] > 0 for d in distritos_abiertos_relevantes)
         )
-        if tiene_doble_remate:
-            lista_mostrar = distritos_sin_rematar if len(distritos_sin_rematar) >= 2 else todos_distritos_abiertos
-            resumen_inc = ", ".join(
-                f"'{d['distrito']}' al {d['dejado_en_pct']}% (Tiro {d['en_tiro']}, Golpe #{d['num_bitacora']})"
+        if tiene_doble_infraccion:
+            lista_mostrar = (
+                distritos_sin_rematar
+                if len(distritos_sin_rematar) >= 2
+                else distritos_abiertos_relevantes
+            )
+            resumen_inc = " y ".join(
+                f"'{d['distrito']}' al {d['dejado_en_pct']}% (Tiro {d['en_tiro']})"
                 for d in lista_mostrar
             )
             infracciones_jugador.append({
-                "codigo": "GATILLO_B_DOBLE_INCONCLUSO",
-                "gravedad": "GRAVE",
+                "regla_vulnerada": "Doble distrito sin rematar (máximo permitido: 1 al quedarte sin tiros)",
+                "gravedad": "Falta Grave",
                 "explicacion": (
-                    f"Acumuló {len(lista_mostrar)} distritos inconclusos en la misma jornada: {resumen_inc}. "
-                    "El máximo aceptable es 1 solo cuando te quedas en 0 ataques restantes."
+                    f"Dejó {len(lista_mostrar)} distritos inconclusos en la misma jornada: {resumen_inc}. "
+                    "Solo se tolera dejar 1 distrito abierto cuando te quedas en 0 ataques restantes."
                 ),
             })
-            for g in reversed(mis_golpes):
-                if g["despues_pct"] < 100:
-                    g.setdefault(
-                        "alerta_forense",
-                        f"🚨 INFRACCIÓN (GATILLO B): Segundo distrito dejado sin rematar ({g['despues_pct']}%)",
-                    )
-                    break
+            for d_ab in lista_mostrar:
+                for g in mis_golpes:
+                    if g["num_bitacora"] == d_ab["num_bitacora"]:
+                        g.setdefault(
+                            "alerta_forense",
+                            f"🚨 Distrito sin rematar ({g['despues_pct']}%)",
+                        )
 
-        # Construir cronología del jugador en el orden real de sus tiros (1/6 a 6/6)
-        cronologia_con_contexto: list[str] = []
-        for d_uid in distritos_tocados_orden:
-            for g in golpes_por_distrito[d_uid]:
-                if g["atacante_tag"] == tag_jug:
-                    nota_alerta = f" | {g['alerta_forense']}" if g.get("alerta_forense") else f" | {g['hito_base']}"
-                    cronologia_con_contexto.append(
-                        f"Tiro {g['tiro_personal_txt']} (Restaban:{g['tiros_restantes_despues']}) | "
-                        f"Golpe #{g['num_bitacora']} ({g['hora_peru']}) | {g['atacante_nombre']} | "
-                        f"{g['distrito_etiqueta']} | {g['antes_pct']}%->{g['despues_pct']}% (+{g['aporte_pct']}%) | "
-                        f"{g['oro_estimado']} oro{nota_alerta}"
-                    )
-                else:
-                    cronologia_con_contexto.append(
-                        f"  ↳ [GOLPE DE COMPAÑERO EN ESE DISTRITO] | Golpe #{g['num_bitacora']} ({g['hora_peru']}) | "
-                        f"{g['atacante_nombre']} | {g['distrito_etiqueta']} | "
-                        f"{g['antes_pct']}%->{g['despues_pct']}% (+{g['aporte_pct']}%) | {g['oro_estimado']} oro | {g['hito_base']}"
-                    )
+        # Construir cronología del jugador en formato Tarjeta Móvil (2 líneas de <= 38 caracteres)
+        cronologia_movil: list[str] = []
+        for g in mis_golpes:
+            estado_corto = g.get("alerta_forense") or g["hito_base"]
+            linea_1 = f"• *Tiro {g['tiro_personal_txt']}* • {g['distrito_etiqueta']}"
+            linea_2 = (
+                f"  └ `{g['antes_pct']}% ➔ {g['despues_pct']}%` (`{g['oro_estimado']}` oro) "
+                f"• Quedaban `{g['tiros_restantes_despues']}` • {estado_corto}"
+            )
+            bloque = f"{linea_1}\n{linea_2}"
+            if g.get("limpieza_ajena_detalle"):
+                bloque += f"\n  └ 🛠️ _{g['limpieza_ajena_detalle']}_"
+            cronologia_movil.append(bloque)
 
         if infracciones_jugador:
-            veredicto = f"🚨 INFRACCIÓN CONFIRMADA ({len(infracciones_jugador)} cargo(s) detectado(s))"
+            veredicto = f"🚨 INFRACCIÓN CONFIRMADA ({len(infracciones_jugador)} falta(s) al reglamento)"
         elif len(distritos_sin_rematar) == 1 and distritos_sin_rematar[0]["restantes_en_ese_momento"] == 0:
             d0 = distritos_sin_rematar[0]
             veredicto = (
                 f"✅ CUMPLIÓ REGLAMENTO (Dejó 1 único distrito '{d0['distrito']}' al {d0['dejado_en_pct']}% "
-                f"en su último tiro {d0['en_tiro']} porque ya tenía 0 ataques disponibles)"
+                f"en su último tiro {d0['en_tiro']} porque ya no le quedaban ataques)"
             )
         else:
-            veredicto = "✅ LIMPIO (Cumplió correctamente con la regla de remates)"
+            veredicto = "✅ LIMPIO (Cumplió correctamente con el reglamento de remates)"
 
         ficha_auditoria = {
             "tag": tag_jug,
@@ -607,7 +586,7 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
             "tiene_infraccion": len(infracciones_jugador) > 0,
             "veredicto_sistema": veredicto,
             "cargos_infraccion": infracciones_jugador,
-            "cronologia_detallada": cronologia_con_contexto,
+            "cronologia_detallada": cronologia_movil,
         }
         auditorias_jugadores[tag_jug] = ficha_auditoria
         if infracciones_jugador:
@@ -617,10 +596,10 @@ def construir_auditoria_capital(asalto: AsaltoCapital) -> dict:
     for g in reversed(golpes_todos):
         nota = g.get("alerta_forense") or g["hito_base"]
         bitacora_enriquecida.append(
-            f"#{g['num_bitacora']}|{g['hora_peru']}|{g['atacante_nombre']}|"
-            f"Tiro:{g.get('tiro_personal_txt', '?')}(Rest:{g.get('tiros_restantes_despues', '?')})|"
-            f"{g['distrito_etiqueta']}|{g['antes_pct']}%->{g['despues_pct']}%(+{g['aporte_pct']}%)|"
-            f"{g['oro_estimado']}|{nota}"
+            f"#{g['num_bitacora']}|{g['atacante_nombre']}|"
+            f"Tiro {g.get('tiro_personal_txt', '?')}(Rest:{g.get('tiros_restantes_despues', '?')})|"
+            f"{g['distrito_etiqueta']}|{g['antes_pct']}%->{g['despues_pct']}%|"
+            f"{g['oro_estimado']} oro|{nota}"
         )
 
     return {

@@ -246,10 +246,26 @@ def _limpiar_formato_whatsapp(texto: str) -> str:
     s = re.sub(r"^#{1,6}\s*(.+)$", r"▸ *\1*", s, flags=re.MULTILINE)
     s = re.sub(r"\*\*+", "*", s)
     s = re.sub(r"^[ \t]*[-*]\s+", "• ", s, flags=re.MULTILINE)
+    s = re.sub(r"^[ \t]*\d+\.\s+", "• ", s, flags=re.MULTILINE)
     s = re.sub(r"^[-─═_]{3,}$", "━━━━━━━━━━━━", s, flags=re.MULTILINE)
+
+    # Auto-formateador móvil: Si una viñeta '• ' tiene >44 caracteres y usa 2 o más separadores
+    # (' - ', ' – ', ' — ', ' | '), la divide automáticamente en encabezado '• ' + sub-línea '  └ '
+    lineas_optimizadas: list[str] = []
+    for linea in s.split("\n"):
+        if linea.startswith("• ") and len(linea) > 44:
+            partes = re.split(r"\s+(?:[–—|]|-(?!\s*>))\s+", linea[2:].strip())
+            if len(partes) >= 3:
+                encabezado = f"• {partes[0].strip()} • {partes[1].strip()}"
+                detalle = " • ".join(p.strip() for p in partes[2:] if p.strip())
+                lineas_optimizadas.append(encabezado)
+                lineas_optimizadas.append(f"  └ {detalle}")
+                continue
+        lineas_optimizadas.append(linea)
+
+    s = "\n".join(lineas_optimizadas)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
-
 
 async def _obtener_memoria_corto_plazo(sesion: AsyncSession, chat_id: str) -> str:
     if not chat_id:
