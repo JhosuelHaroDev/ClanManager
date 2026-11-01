@@ -14,9 +14,14 @@ from app.api.dependencias import ClienteClash, SesionBD
 from app.config import settings
 from app.db.sesion import FabricaSesion
 from app.models.stacy import DirectorioMiembro, StacyMensajeWhatsapp
+from app.services import asaltos as servicio_asaltos
 from app.services.clash_client import ClashClient, normalizar_tag
 from app.services.stacy_ai import procesar_consulta_stacy
 from app.services.migracion_pdfs import consolidar_y_migrar_todo
+from app.services.stacy_proactiva import (
+    auditar_y_alertar_infracciones_capital,
+    disparar_alerta_guerra,
+)
 
 logger = logging.getLogger("clanmanager.whatsapp")
 
@@ -244,7 +249,6 @@ async def recibir_webhook_green_api(
 
     return {"status": "ok", "detail": "Queued for processing"}
 
-
 async def _procesar_y_responder_whatsapp(
     id_message: str,
     chat_id: str,
@@ -348,3 +352,28 @@ async def _enviar_estado_escribiendo(chat_id: str, duracion_ms: int = 4000) -> N
             await http.post(url, json={"chatId": chat_id, "typingTime": duracion_ms})
     except httpx.HTTPError:
         pass
+
+@router.post("/auditar-capital")
+async def ejecutar_auditoria_capital_manual(
+    cliente: ClienteClash,
+    sesion: SesionBD,
+    enviar_a_whatsapp: bool = False,
+    forzar_reenvio: bool = False,
+) -> dict:
+    """
+    Ejecuta la Etapa 2 y el Motor Forense de Capital en vivo.
+    Si `enviar_a_whatsapp=True`, publica las denuncias detectadas en el grupo oficial.
+    """
+    asalto = await servicio_asaltos.guardar_asalto_actual(sesion, cliente)
+    if asalto is None:
+        return {"error": "Sin asalto activo"}
+    auditoria = servicio_asaltos.construir_auditoria_capital(asalto)
+    resultado_wa = None
+    if enviar_a_whatsapp:
+        resultado_wa = await auditar_y_alertar_infracciones_capital(
+            cliente, forzar_envio=forzar_reenvio
+        )
+    return {
+        "infractores_confirmados": auditoria["infractores_confirmados"],
+        "notificacion_whatsapp": resultado_wa,
+    }

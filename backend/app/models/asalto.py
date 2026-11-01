@@ -2,20 +2,14 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 
 class AsaltoCapital(Base):
-    """
-    Un fin de semana de asaltos completo.
-
-    Igual que Guerra, no acumula una fila nueva por cada sondeo: se
-    identifica por su fecha de inicio, única para cada fin de semana, y se
-    actualiza en el lugar a medida que se reciben más datos.
-    """
+    """Un fin de semana de asaltos completo."""
 
     __tablename__ = "asaltos_capital"
     __table_args__ = (UniqueConstraint("inicio"),)
@@ -68,14 +62,7 @@ class AsaltoMiembro(Base):
 
 
 class AsaltoRegistro(Base):
-    """
-    Una entrada del registro de asaltos contra un clan, propia o recibida.
-
-    "sentido" distingue si fuimos nosotros quienes atacamos a ese clan
-    ("ofensivo") o si fue ese clan el que nos atacó a nosotros
-    ("defensivo"), la misma distinción que separaba attackLog de
-    defenseLog en la respuesta de Supercell.
-    """
+    """Una entrada del registro de asaltos contra un clan, propia o recibida."""
 
     __tablename__ = "asalto_registros"
 
@@ -106,8 +93,6 @@ class AsaltoDistrito(Base):
     registro_id: Mapped[int] = mapped_column(
         ForeignKey("asalto_registros.id", ondelete="CASCADE"), index=True
     )
-    # El id que le asigna el propio juego al distrito, distinto de nuestro
-    # id interno de fila.
     distrito_id_juego: Mapped[int]
     nombre: Mapped[str] = mapped_column(String(50))
     nivel: Mapped[int]
@@ -123,15 +108,7 @@ class AsaltoDistrito(Base):
 
 
 class AsaltoAtaque(Base):
-    """
-    Un ataque individual contra un distrito.
-
-    A diferencia de GuerraAtaque, no lleva un número de orden, porque
-    Supercell no lo entrega para los ataques de asalto, así que no hay
-    una restricción de unicidad natural que declarar aquí: la prevención
-    de duplicados corre por cuenta de que el servicio siempre borra y
-    reconstruye los ataques de un distrito completos en cada sondeo.
-    """
+    """Un ataque individual contra un distrito con marca de tiempo de detección."""
 
     __tablename__ = "asalto_ataques"
 
@@ -143,5 +120,11 @@ class AsaltoAtaque(Base):
     atacante_nombre: Mapped[str] = mapped_column(String(50))
     estrellas: Mapped[int]
     destruccion: Mapped[int]
+
+    # Campos de auditoría forense (Etapa 2 de sondeo)
+    detectado_en: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    orden_aparicion: Mapped[int | None] = mapped_column(Integer)
 
     distrito: Mapped["AsaltoDistrito"] = relationship(back_populates="ataques")

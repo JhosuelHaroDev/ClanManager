@@ -13,6 +13,8 @@ from app.config import settings
 from app.db.sesion import FabricaSesion
 from app.models.guerra import Guerra
 from app.models.stacy import StacyAristaGrafo, StacyMensajeWhatsapp
+from app.models.asalto import AsaltoCapital, AsaltoDistrito, AsaltoRegistro
+from app.services import asaltos as servicio_asaltos
 from app.services import guerras as servicio_guerras
 from app.services.clash_client import ClashApiError, ClashClient
 from app.services.stacy_ai import (
@@ -52,7 +54,9 @@ def _obtener_chat_id_principal() -> str | None:
     if not settings.allowed_group_id:
         return None
     grupos = [g.strip() for g in settings.allowed_group_id.split(",") if g.strip()]
-    return grupos[1] if grupos else None
+    if not grupos:
+        return None
+    return grupos[1] if len(grupos) > 1 else grupos[0]
 
 
 async def disparar_alerta_guerra(
@@ -275,3 +279,98 @@ async def _redactar_con_cola_etapa2(prompt_e2: str) -> tuple[str, dict]:
         "🚨 *AVISO AUTOMÁTICO DE GUERRA — S.T.A.C.Y.*\n\nRevisa el mapa de guerra activa del clan.",
         {"modelo": "fallback", "tokens": 0, "costo": 0.0, "latencia": 0.0},
     )
+
+async def auditar_y_alertar_infracciones_capital(
+    cliente: ClashClient,
+    forzar_envio: bool = False,
+) -> dict:
+    """
+    Revisa la auditoría forense del asalto actual y, si detecta una infracción consumada
+    (Gatillo A, B o C) que aún no haya sido denunciada en el grupo, envía el reporte
+    automático con Asunto, Veredicto y Pruebas (Cronología).
+    """
+    chat_id = _obtener_chat_id_principal()
+    if not chat_id:
+        return {"alertas_enviadas": 0, "motivo": "ALLOWED_GROUP_ID no configurado"}
+
+    alertas_enviadas = []
+
+    async with FabricaSesion() as sesion:
+        res = await sesion.execute(
+            select(AsaltoCapital)
+            .order_by(AsaltoCapital.inicio.desc())
+            .limit(1)
+            .options(
+                selectinload(AsaltoCapital.miembros),
+                selectinload(AsaltoCapital.registros)
+                .selectinload(AsaltoRegistro.distritos)
+                .selectinload(AsaltoDistrito.ataques),
+            )
+        )
+        asalto = res.scalar_one_or_none()
+        if asalto is None:
+            return {"alertas_enviadas": 0, "motivo": "Sin asalto registrado"}
+
+        auditoria = servicio_asaltos.construir_auditoria_capital(asalto)
+        infractores = auditoria.get("infractores_confirmados") or []
+
+        for ficha in infractores:
+            # ID de idempotencia por asalto, jugador y cantidad de cargos
+            tag_limpio = ficha["tag"].replace("#", "")
+            cant_cargos = len(ficha["cargos_infraccion"])
+            id_alerta = f"PROACTIVO_CAP_{asalto.id}_{tag_limpio}_C{cant_cargos}"
+
+            if not forzar_envio:
+                ya_enviado = await sesion.get(StacyMensajeWhatsapp, id_alerta)
+                if ya_enviado is not None:
+                    continue
+
+            prompt_e2 = (
+                "[MODO AUDITORÍA FORENSE AUTOMÁTICA DE CAPITAL — S.T.A.C.Y.]\n"
+                "[Destinatario: Grupo Oficial del clan 'Melanie Stacy' y Alto Mando]\n\n"
+                f"EXPEDIENTE DE INFRACCIÓN DETECTADO EN TIEMPO REAL:\n"
+                f"{json.dumps(ficha, ensure_ascii=False)}\n\n"
+                "INSTRUCCIÓN DE REDACCIÓN:\n"
+                "Redacta una notificación oficial de auditoría para el grupo de WhatsApp con esta estructura exacta:\n"
+                "1. Título impactante: 🚨 *AUDITORÍA DE CAPITAL: INFRACCIÓN DETECTADA*\n"
+                "2. *Asunto:* Breve descripción de 1 línea indicando el nombre del jugador, sus tiros usados y la falta cometida.\n"
+                "3. ▸ *VEREDICTO DEL SISTEMA*: Explica claramente cuál(es) regla(s) rompió según `cargos_infraccion` "
+                "(mencionando si dejó un distrito abierto teniendo ataques disponibles o si acumuló 2 distritos sin rematar, "
+                "y nombrando al compañero que tuvo que limpiarlo si aplica).\n"
+                "4. ▸ *PRUEBAS Y CRONOLOGÍA DE ATAQUES*: Lista cada tiro de `cronologia_detallada` mostrando el número de tiro (`1/6`..`6/6`), "
+                "los ataques que le quedaban disponibles, el distrito, el porcentaje (`Antes% -> Después%`), el oro y cualquier limpieza de compañero.\n"
+                "Usa un tono firme, analítico y con ironía fina hacia el farmeo egoísta de oro."
+            )
+
+            texto_final, meta = await _redactar_con_cola_etapa2(prompt_e2)
+
+            registro = await sesion.get(StacyMensajeWhatsapp, id_alerta)
+            if registro is None:
+                registro = StacyMensajeWhatsapp(
+                    id_message_wa=id_alerta,
+                    chat_id=chat_id,
+                    telefono_remitente="AUDITOR_CAPITAL",
+                    nombre_whatsapp="Auditoría Automática Capital",
+                    jugador_tag_vinculado=ficha["tag"],
+                    nivel_acceso_aplicado="CLAN_GLOBAL",
+                    mensaje_usuario=f"[AUDITORÍA CAPITAL: {ficha['nick']}]",
+                )
+                sesion.add(registro)
+
+            registro.respuesta_stacy = texto_final
+            registro.modelo_etapa_1 = "forensic_engine"
+            registro.modelo_etapa_2 = meta["modelo"]
+            registro.herramientas_usadas = ["auditoria_capital_2_etapas"]
+            registro.tokens_totales = meta["tokens"]
+            registro.costo_total_usd = meta["costo"]
+            registro.latencia_segundos = meta["latencia"]
+            await sesion.commit()
+
+            exito_wa = await _enviar_whatsapp_grupo(chat_id, texto_final)
+            alertas_enviadas.append({
+                "jugador": ficha["nick"],
+                "id_alerta": id_alerta,
+                "enviado": exito_wa,
+            })
+
+    return {"alertas_enviadas": len(alertas_enviadas), "detalles": alertas_enviadas}

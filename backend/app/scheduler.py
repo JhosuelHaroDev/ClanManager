@@ -205,26 +205,33 @@ def _dentro_de_ventana_de_asaltos(ahora: datetime) -> bool:
 
 
 async def capturar_asalto_periodicamente(cliente: ClashClient) -> None:
-    """Tarea programada: guarda o actualiza el fin de semana de asaltos más reciente."""
+    """
+    Tarea programada cada 1 minuto durante el Fin de Semana de Asaltos:
+    - Etapa 1: Comprueba en RAM si aumentó `totalAttacks`. Si sigue igual, termina en 0ms.
+    - Etapa 2: Si subió el contador (o si se cumplieron 15 min para el Gatillo C),
+      actualiza PostgreSQL preservando timestamps y dispara la auditoría proactiva de WhatsApp.
+    """
     ahora = datetime.now(timezone.utc)
     if not _dentro_de_ventana_de_asaltos(ahora):
-        logger.debug("Fuera de la ventana del Fin de Semana de Asaltos, se pospone el sondeo")
         return
 
     async with FabricaSesion() as sesion:
         try:
-            asalto = await servicio_asaltos.guardar_asalto_actual(sesion, cliente)
+            asalto, hubo_cambio = await servicio_asaltos.sondear_asalto_dos_etapas(
+                sesion, cliente
+            )
         except ClashApiError as error:
             logger.error("Falló el sondeo de asaltos: %s", error)
             return
 
-    if asalto is None:
-        return
-
-    logger.info(
-        "Asalto actualizado: id=%s estado=%s oro_total=%s ataques=%s",
-        asalto.id, asalto.estado, asalto.oro_capital_total, asalto.ataques_totales,
-    )
+    if hubo_cambio and asalto is not None:
+        logger.info(
+            "Etapa 2 Capital ejecutada: id=%s oro_total=%s ataques=%s",
+            asalto.id, asalto.oro_capital_total, asalto.ataques_totales,
+        )
+        await stacy_proactiva.auditar_y_alertar_infracciones_capital(cliente)
+    elif servicio_asaltos.hay_posible_timeout_pendiente(ahora):
+        await stacy_proactiva.auditar_y_alertar_infracciones_capital(cliente)
 
 
 def crear_programador(cliente: ClashClient) -> AsyncIOScheduler:

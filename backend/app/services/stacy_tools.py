@@ -794,12 +794,11 @@ async def _tool_consultar_jugador_en_vivo(args: dict, cliente: ClashClient) -> d
 
 
 # =========================================================================
-# TOOL 4: ASALTOS A LA CAPITAL (REFRESCO AL ÚLTIMO SEGUNDO)
+# TOOL 4: ASALTOS A LA CAPITAL + AUDITORÍA FORENSE (GATILLOS A, B Y C)
 # =========================================================================
 async def _tool_consultar_asaltos_capital(
     args: dict, sesion: AsyncSession, cliente: ClashClient
 ) -> dict:
-    # Sincronizar siempre en tiempo real desde Supercell (~0.25s)
     try:
         await servicio_asaltos.guardar_asalto_actual(sesion, cliente)
     except ClashApiError as exc:
@@ -820,67 +819,49 @@ async def _tool_consultar_asaltos_capital(
     if asalto is None:
         return {"error": "No hay temporadas de Asaltos a la Capital registradas."}
 
+    auditoria_global = servicio_asaltos.construir_auditoria_capital(asalto)
     tipo = str(args.get("tipo_consulta") or "ranking").lower()
+    filtro = str(args.get("filtro") or "todos").lower()
     buscar_jug = _limpiar_nick(args.get("nombre_jugador")).lower()
 
-    if tipo == "bitacora":
-        golpes = []
-        correlativo = 1
-        registros_ofensivos = [r for r in asalto.registros if r.sentido == "ofensivo"]
-        for reg in reversed(registros_ofensivos):
-            for dist in reversed(reg.distritos):
-                atks_cron = list(reversed(dist.ataques))
-                acum = 0
-                golpes_dist = []
-                for atk in atks_cron:
-                    antes = acum
-                    despues = atk.destruccion
-                    aporte = max(0, despues - antes)
-                    oro_est = round((aporte / dist.destruccion) * dist.saqueado) if dist.destruccion > 0 else 0
-                    if antes == 0 and despues == 100:
-                        hito = "ONE_SHOT(100%)"
-                    elif despues == 100:
-                        hito = "REMATE_BONUS(100%)"
-                    elif 90 <= despues < 100:
-                        hito = f"DEJADO_AL_{despues}%"
-                    elif antes == 0:
-                        hito = "APERTURA"
-                    else:
-                        hito = "PROGRESO"
+    # 1. Si consultan por un jugador específico (ej. Mati_5), devolver su expediente forense completo
+    if buscar_jug:
+        coincidencias_aud = [
+            ficha
+            for ficha in auditoria_global["auditorias_por_tag"].values()
+            if buscar_jug in ficha["nick"].lower()
+        ]
+        if coincidencias_aud:
+            return {
+                "modo": "EXPEDIENTE_FORENSE_INDIVIDUAL_CAPITAL",
+                "regla_clan_aplicada": (
+                    "1) Prohibido dejar un distrito sin rematar teniendo ataques disponibles para irse a otro distrito. "
+                    "2) Máximo tolerable: 1 distrito inconcluso SOLO si ocurrió en tu último tiro (0 ataques restantes). "
+                    "Dejar 2 o más distritos sin rematar es infracción directa."
+                ),
+                "expedientes": coincidencias_aud,
+            }
 
-                    golpes_dist.append({
-                        "nick": atk.atacante_nombre,
-                        "dist": f"{dist.nombre}({reg.clan_nombre})",
-                        "prog": f"{antes}%->{despues}%(+{aporte}%)",
-                        "oro": oro_est,
-                        "hito": hito,
-                    })
-                    acum = despues
-
-                for g in reversed(golpes_dist):
-                    g["num"] = correlativo
-                    correlativo += 1
-                    if not buscar_jug or buscar_jug in g["nick"].lower():
-                        golpes.append(g)
-
-        corte = golpes[: (25 if buscar_jug else 20)]
+    # 2. Si piden bitácora o auditoría de infractores
+    if tipo in ("bitacora", "auditoria") or filtro == "infractores":
         return {
-            "pestana": "Bitacora Asaltos (PostgreSQL)",
-            "coincidencias": len(golpes),
-            "columnas": "#Golpe|Jugador|Distrito(ClanRival)|Antes->Despues(Aporte)|OroEst|Hito",
-            "filas": [
-                f"#{g['num']}|{g['nick']}|{g['dist']}|{g['prog']}|{g['oro']}|{g['hito']}"
-                for g in corte
-            ],
+            "pestana": "Auditoría Forense y Bitácora de Capital (PostgreSQL)",
+            "total_infractores_detectados": len(auditoria_global["infractores_confirmados"]),
+            "infractores_detalle": auditoria_global["infractores_confirmados"] or ["Ningún infractor detectado hasta el momento."],
+            "columnas_bitacora": "#Golpe|Hora|Jugador|Tiro(Restantes)|Distrito(ClanRival)|Antes->Despues(Aporte)|OroEst|VeredictoGolpe",
+            "ultimos_25_golpes": auditoria_global["bitacora_enriquecida"][:25],
         }
 
+    # 3. Ranking general cruzado con el roster actual y el estado de auditoría forense
     ultima_cap = await _asegurar_captura_fresca(sesion, cliente, max_edad_segundos=300)
     miembros_clan = {m.tag: m.nombre for m in ultima_cap.miembros} if ultima_cap else {}
     mapa_asaltantes = {m.tag: m for m in asalto.miembros}
+    aud_por_tag = auditoria_global["auditorias_por_tag"]
 
     ranking = []
     for tag_c, nombre_c in miembros_clan.items():
         am = mapa_asaltantes.get(tag_c)
+        ficha_a = aud_por_tag.get(tag_c)
         if am:
             perm = am.limite_ataques + am.ataques_bono
             prom = round(am.oro_capital_saqueado / am.ataques_usados) if am.ataques_usados > 0 else 0
@@ -889,6 +870,8 @@ async def _tool_consultar_asaltos_capital(
                 if (am.ataques_usados == perm and am.ataques_bono > 0)
                 else ("Completo" if am.ataques_usados == perm else "Incompleto")
             )
+            if ficha_a and ficha_a["tiene_infraccion"]:
+                obs += " [🚨 INFRACTOR REMATE]"
             ranking.append({
                 "nick": nombre_c,
                 "usados": am.ataques_usados,
@@ -924,16 +907,13 @@ async def _tool_consultar_asaltos_capital(
             })
 
     ranking.sort(key=lambda x: (-x["oro"], -x["usados"]))
-    filtro = str(args.get("filtro") or "todos").lower()
 
     filtrados = []
     for idx, r in enumerate(ranking, start=1):
         r["pos"] = idx
-        if buscar_jug and buscar_jug not in r["nick"].lower():
-            continue
         if filtro == "sin_atacar" and r["obs"] != "Sin Ataques":
             continue
-        if filtro == "incompletos" and r["obs"] != "Incompleto":
+        if filtro == "incompletos" and "Incompleto" not in r["obs"]:
             continue
         if filtro == "turistas" and "Turista" not in r["obs"]:
             continue
@@ -945,11 +925,16 @@ async def _tool_consultar_asaltos_capital(
     kpis = (
         f"Estado: {asalto.estado} | OroTotal: {asalto.oro_capital_total:,} | "
         f"Ataques: {asalto.ataques_totales} | Incursiones: {asalto.asaltos_completados} | "
-        f"DistritosDestruidos: {asalto.distritos_rivales_destruidos}"
+        f"DistritosDestruidos: {asalto.distritos_rivales_destruidos} | "
+        f"InfractoresRemate: {len(auditoria_global['infractores_confirmados'])}"
     )
 
     return {
         "kpis": kpis,
+        "infractores_confirmados": [
+            f"{inf['nick']} ({inf['tiros_txt']}): {inf['veredicto_sistema']}"
+            for inf in auditoria_global["infractores_confirmados"]
+        ],
         "total": len(filtrados),
         "columnas": "Pos|Jugador|Tiros|Bonus6to|OroTotal|PromPorTiro|Estado",
         "filas": [
