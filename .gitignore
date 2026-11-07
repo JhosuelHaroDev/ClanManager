@@ -1,3 +1,8 @@
 .venv/
 .env
 __pycache__/
+contexto/
+
+# Carpeta local de contexto en .txt
+contexto/
+generar_contexto.py

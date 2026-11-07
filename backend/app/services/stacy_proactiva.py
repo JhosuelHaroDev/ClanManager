@@ -1,28 +1,32 @@
+# === ARCHIVO: ClanManager\backend\app\services\stacy_proactiva.py ===
 """Motor de anuncios proactivos automáticos de S.T.A.C.Y. hacia el grupo de WhatsApp."""
 
 import json
 import logging
+import re
 import time
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db.sesion import FabricaSesion
+from app.models.asalto import AsaltoCapital, AsaltoDistrito, AsaltoRegistro
 from app.models.guerra import Guerra
 from app.models.stacy import StacyAristaGrafo, StacyMensajeWhatsapp
-from app.models.asalto import AsaltoCapital, AsaltoDistrito, AsaltoRegistro
 from app.services import asaltos as servicio_asaltos
 from app.services import guerras as servicio_guerras
 from app.services.clash_client import ClashApiError, ClashClient
 from app.services.stacy_ai import (
     _CIRCUIT_BREAKER_429,
+    _MOTIVO_BLOQUEO,
     _calcular_costo_usd,
     _construir_cola_activa,
     _limpiar_formato_whatsapp,
     _llamar_redactor_etapa2,
+    _registrar_exito_modelo,
+    _registrar_fallo_modelo,
 )
 from app.services.stacy_tools import _reconstruir_estado_guerra
 
@@ -100,7 +104,6 @@ async def disparar_alerta_guerra(
             candidatas = list(res.scalars().all())
             if not candidatas:
                 return {"enviado": False, "motivo": "No hay guerra registrada en PostgreSQL."}
-            # En CWL hay una ronda en 'inWar' y la siguiente en 'preparation': priorizar 'inWar'
             en_batalla = [g for g in candidatas if g.estado == "inWar"]
             guerra = en_batalla[0] if en_batalla else candidatas[0]
 
@@ -110,7 +113,6 @@ async def disparar_alerta_guerra(
             if ya_enviado is not None:
                 return {"enviado": False, "motivo": f"Alerta {id_alerta} ya fue enviada previamente."}
 
-        # Cargar acuerdos de espejo activos en el Grafo de Memoria
         res_grafo = await sesion.execute(
             select(StacyAristaGrafo)
             .where(
@@ -145,7 +147,6 @@ async def disparar_alerta_guerra(
 
         texto_final, meta = await _redactar_con_cola_etapa2(prompt_e2)
 
-        # Registrar en stacy_mensajes_whatsapp para idempotencia y memoria de corto plazo
         registro = await sesion.get(StacyMensajeWhatsapp, id_alerta)
         if registro is None:
             registro = StacyMensajeWhatsapp(
@@ -249,53 +250,99 @@ def _construir_instruccion_evento(tipo_evento: str, guerra: Guerra) -> str:
     )
 
 
-async def _redactar_con_cola_etapa2(prompt_e2: str) -> tuple[str, dict]:
+async def _redactar_con_cola_etapa2(
+    prompt_e2: str,
+    incluir_firma: bool = True,
+) -> tuple[str, dict]:
     t0 = time.monotonic()
     cola_e2 = _construir_cola_activa(2)
-    ahora_ts = time.time()
-    historial_saltos = []
+    historial_saltos: list[str] = []
 
     async with httpx.AsyncClient(timeout=25.0) as http:
         for prov2 in cola_e2:
+            ahora_ts = time.time()
+            nombre_corto = prov2["modelo"].split("/")[-1]
             if _CIRCUIT_BREAKER_429.get(prov2["modelo"], 0) > ahora_ts:
-                historial_saltos.append(f"E2:{prov2['modelo'].split('/')[-1]}[429]")
+                motivo = _MOTIVO_BLOQUEO.get(prov2["modelo"], "429")
+                historial_saltos.append(f"E2:{nombre_corto}[{motivo}]")
                 continue
 
             res2 = await _llamar_redactor_etapa2(http, prov2, prompt_e2)
             if res2["exito"] and res2.get("texto"):
-                modelo_e2 = prov2["modelo"].split("/")[-1]
+                modelo_e2 = nombre_corto[:50]
                 u2 = res2.get("usage") or {}
                 tokens = sum(
                     int(u2.get(k) or 0)
                     for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
                 )
                 costo = _calcular_costo_usd(prov2["modelo"], u2)
+                _registrar_exito_modelo(prov2["modelo"], tokens)
+
                 latencia = round(time.monotonic() - t0, 1)
                 texto_limpio = _limpiar_formato_whatsapp(res2["texto"])
+                nota_salto = f"\n↪ _Saltó: {', '.join(historial_saltos)}_" if historial_saltos else ""
+                txt_costo = f" (${costo:.4f})" if costo > 0 else " ($0 Gratis)"
+                firma_str = (
+                    f"\n━━━━━━━━━━━━\n🤖 _S.T.A.C.Y. [Auto-Scheduler ➔ {modelo_e2}] • "
+                    f"⏱️ {latencia}s • 🪙 {tokens:,} tok{txt_costo}_{nota_salto}"
+                )
 
-                if settings.mostrar_firma_modelo:
-                    txt_costo = f" (${costo:.4f})" if costo > 0 else " ($0 Gratis)"
-                    nota_salto = f"\n↪ _Saltó: {', '.join(historial_saltos)}_" if historial_saltos else ""
-                    texto_limpio += (
-                        f"\n━━━━━━━━━━━━\n🤖 _S.T.A.C.Y. [Auto-Scheduler ➔ {modelo_e2}] • "
-                        f"⏱️ {latencia}s • 🪙 {tokens:,} tok{txt_costo}_{nota_salto}"
-                    )
+                if incluir_firma and settings.mostrar_firma_modelo:
+                    texto_limpio += firma_str
+
                 return texto_limpio, {
                     "modelo": modelo_e2,
                     "tokens": tokens,
                     "costo": costo,
                     "latencia": latencia,
+                    "firma": firma_str if settings.mostrar_firma_modelo else "",
                 }
 
             err2 = str(res2.get("error") or "")
-            if "429" in err2:
-                _CIRCUIT_BREAKER_429[prov2["modelo"]] = ahora_ts + 60.0
-            historial_saltos.append(f"E2:{prov2['modelo'].split('/')[-1]}")
+            etiqueta_err = _registrar_fallo_modelo(
+                prov2["modelo"],
+                err2,
+                res2.get("retry_after"),
+            )
+            historial_saltos.append(f"E2:{nombre_corto}[{etiqueta_err}]")
 
     return (
         "🚨 *AVISO AUTOMÁTICO DE GUERRA — S.T.A.C.Y.*\n\nRevisa el mapa de guerra activa del clan.",
-        {"modelo": "fallback", "tokens": 0, "costo": 0.0, "latencia": 0.0},
+        {"modelo": "fallback", "tokens": 0, "costo": 0.0, "latencia": 0.0, "firma": ""},
     )
+
+
+def _ensamblar_alerta_capital_hibrida(
+    ficha: dict,
+    asunto_ia: str,
+    cierre_ia: str,
+    firma_str: str,
+) -> str:
+    """
+    Ensambla de forma determinista el expediente forense de Capital garantizando que la
+    cronología de ataques nunca se trunque y mantenga el diseño de Tarjetas Móviles.
+    """
+    bloques_cargos: list[str] = []
+    for cargo in ficha.get("cargos_infraccion") or []:
+        bloques_cargos.append(
+            f"• *{cargo['regla_vulnerada']}*\n  └ {cargo['explicacion']}"
+        )
+
+    seccion_cargos = "\n".join(bloques_cargos)
+    seccion_cronologia = "\n".join(ficha.get("cronologia_detallada") or [])
+
+    partes = [
+        "🚨 *AUDITORÍA DE CAPITAL: FALTA DETECTADA*",
+        f"*Asunto:* {asunto_ia}",
+        f"▸ *REGLA VULNERADA*\n{seccion_cargos}",
+        f"▸ *CRONOLOGÍA DE ATAQUES*\n{seccion_cronologia}",
+    ]
+    if cierre_ia:
+        partes.append(f"💬 _{cierre_ia.strip('_')}_")
+
+    cuerpo = "\n\n".join(partes)
+    return f"{cuerpo}{firma_str}"
+
 
 async def auditar_y_alertar_infracciones_capital(
     cliente: ClashClient,
@@ -303,8 +350,8 @@ async def auditar_y_alertar_infracciones_capital(
 ) -> dict:
     """
     Revisa la auditoría forense del asalto actual y, si detecta una infracción consumada
-    (Gatillo A, B o C) que aún no haya sido denunciada en el grupo, envía el reporte
-    automático con Asunto, Veredicto y Pruebas (Cronología).
+    que aún no haya sido denunciada en el grupo, ensambla el reporte híbrido (Asunto +
+    Comentario por IA + Cronología determinista en Python) y lo envía por WhatsApp.
     """
     chat_id = _obtener_chat_id_principal()
     if not chat_id:
@@ -332,7 +379,6 @@ async def auditar_y_alertar_infracciones_capital(
         infractores = auditoria.get("infractores_confirmados") or []
 
         for ficha in infractores:
-            # ID de idempotencia por asalto, jugador y cantidad de cargos
             tag_limpio = ficha["tag"].replace("#", "")
             cant_cargos = len(ficha["cargos_infraccion"])
             id_alerta = f"PROACTIVO_CAP_{asalto.id}_{tag_limpio}_C{cant_cargos}"
@@ -342,25 +388,43 @@ async def auditar_y_alertar_infracciones_capital(
                 if ya_enviado is not None:
                     continue
 
-            prompt_e2 = (
-                "[MODO AUDITORÍA FORENSE AUTOMÁTICA DE CAPITAL — S.T.A.C.Y.]\n"
-                "[Destinatario: Grupo Oficial del clan 'Melanie Stacy' y Alto Mando]\n\n"
-                f"EXPEDIENTE DE INFRACCIÓN DETECTADO:\n"
-                f"{json.dumps(ficha, ensure_ascii=False)}\n\n"
-                "INSTRUCCIÓN DE REDACCIÓN MÓVIL (LÍNEAS CORTAS <= 38 CARACTERES):\n"
-                "Redacta la notificación oficial para WhatsApp siguiendo exactamente esta estructura:\n"
-                "1. 🚨 *AUDITORÍA DE CAPITAL: FALTA DETECTADA*\n"
-                "2. *Asunto:* 1 oración clara con el nombre del jugador, sus tiros (`6/6`) y la falta cometida.\n"
-                "3. ▸ *REGLA VULNERADA*\n"
-                "   Explica cada falta de `cargos_infraccion` usando el nombre claro de `regla_vulnerada` "
-                "(PROHIBIDO escribir códigos técnicos como 'GATILLO_A' o 'GATILLO_B').\n"
-                "4. ▸ *CRONOLOGÍA DE ATAQUES*\n"
-                "   Inserta los bloques de `cronologia_detallada` respetando su formato de 2 líneas cortas "
-                "(`• *Tiro X/6* • Distrito` arriba y `  └ % (oro) • Quedaban X` abajo) para que se lea perfecto en celular.\n"
-                "5. Cierra con una observación breve y directa."
+            resumen_cargos = "; ".join(
+                f"{c['regla_vulnerada']} ({c['explicacion']})"
+                for c in (ficha.get("cargos_infraccion") or [])
             )
 
-            texto_final, meta = await _redactar_con_cola_etapa2(prompt_e2)
+            # Prompt ultraligero (~180 tokens): la IA solo redacta el Asunto y el Cierre irónico
+            prompt_e2 = (
+                "[MODO AUDITORÍA FORENSE DE CAPITAL — S.T.A.C.Y.]\n"
+                f"Jugador infractor: {ficha['nick']} | Tiros: `{ficha['tiros_txt']}` | Oro: `{ficha['oro_total']:,}`\n"
+                f"Faltas detectadas: {resumen_cargos}\n\n"
+                "TAREA: Redacta únicamente 2 líneas en español con tu tono agudo del Alto Mando:\n"
+                "ASUNTO: <1 oración directa con el nombre del jugador, sus tiros entre acentos graves y la falta cometida>\n"
+                "CIERRE: <1 observación final breve e irónica de máximo 25 palabras recordando rematar los distritos>"
+            )
+
+            texto_ia, meta = await _redactar_con_cola_etapa2(prompt_e2, incluir_firma=False)
+
+            asunto_match = re.search(r"ASUNTO:\s*(.+)", texto_ia, flags=re.IGNORECASE)
+            cierre_match = re.search(r"CIERRE:\s*(.+)", texto_ia, flags=re.IGNORECASE)
+
+            asunto_final = (
+                asunto_match.group(1).strip()
+                if asunto_match
+                else f"*{ficha['nick']}* (`{ficha['tiros_txt']}`) incumplió el reglamento de remates en la Capital del Clan."
+            )
+            cierre_final = (
+                cierre_match.group(1).strip()
+                if cierre_match
+                else "En este clan quien abre un distrito y tiene tiros libres lo termina; nada de dejarle el trabajo sucio a los compañeros."
+            )
+
+            texto_final = _ensamblar_alerta_capital_hibrida(
+                ficha=ficha,
+                asunto_ia=asunto_final,
+                cierre_ia=cierre_final,
+                firma_str=meta.get("firma", ""),
+            )
 
             registro = await sesion.get(StacyMensajeWhatsapp, id_alerta)
             if registro is None:

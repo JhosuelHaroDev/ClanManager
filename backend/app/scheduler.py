@@ -187,20 +187,6 @@ async def capturar_liga_una_vez(
         )
         if programador is not None:
             _programar_hitos_guerra(programador, cliente, guerra)
-    """Tarea programada: sondea la Liga de Guerras de Clanes (CWL) actual."""
-    async with FabricaSesion() as sesion:
-        try:
-            resultado = await servicio_guerras.guardar_liga_actual(sesion, cliente)
-        except ClashApiError as error:
-            logger.debug("Sin Liga de Guerras de Clanes activa o falló el sondeo: %s", error)
-            return
-
-    for guerra in resultado.guerras_propias:
-        logger.info(
-            "Guerra de CWL actualizada: ronda=%s id=%s estado=%s rival=%s estrellas=%s/%s",
-            guerra.liga_ronda, guerra.id, guerra.estado, guerra.rival_nombre,
-            guerra.clan_estrellas, guerra.rival_estrellas,
-        )
 
 
 def _inicio_ventana_mas_reciente(ahora: datetime) -> datetime:

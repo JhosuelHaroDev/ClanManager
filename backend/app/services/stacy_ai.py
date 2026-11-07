@@ -1,4 +1,5 @@
-"""Orquestador híbrido con Bucle Agéntico ReAct en Etapa 1 (Modelos Pesados) + Redactora Etapa 2."""
+# === ARCHIVO: ClanManager\backend\app\services\stacy_ai.py ===
+"""Orquestador híbrido con Balanceador de Cuotas, Rotación Inter-Etapa y Bucle ReAct."""
 
 import json
 import logging
@@ -23,27 +24,36 @@ from app.services.stacy_tools import (
 
 logger = logging.getLogger("clanmanager.stacy_ai")
 
+# Disyuntor (Circuit Breaker) compartido y estado de telemetría en RAM por modelo
 _CIRCUIT_BREAKER_429: dict[str, float] = {}
-MAX_ITERACIONES_ETAPA_1 = 3
+_MOTIVO_BLOQUEO: dict[str, str] = {}
+_ESTADO_MODELOS: dict[str, dict] = {}
 
-# 🔹 ETAPA 1: Modelos pesados para razonamiento multi-herramienta y verificación ReAct
+MAX_ITERACIONES_ETAPA_1 = 3
+UMBRAL_TOKENS_SUAVE_60S = 3500
+COOLDOWN_ENTRE_LLAMADAS_SEG = 3.5
+
+# 🔹 ETAPA 1: Prioriza modelos ágiles y precisos en Function Calling.
+# Anthropic Haiku queda como único respaldo económico de pago en Etapa 1.
 COLA_ENRUTADOR_ETAPA_1 = [
-    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-120b"},
     {"activo": True, "proveedor": "GROQ",      "modelo": "qwen/qwen3-32b"},
-    {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
     {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-20b"},
-    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-sonnet-5-5"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "meta-llama/llama-4-scout-17b-16e-instruct"},
+    {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-120b"},
     {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-haiku-5-5"},
 ]
 
-# 🔹 ETAPA 2: Modelos pesados para redacción final de S.T.A.C.Y.
+# 🔹 ETAPA 2: Prioriza los modelos más potentes para redacción táctica.
+# En caso de caída total de gratuitos, entra Haiku (20x más barato) antes que Sonnet.
 COLA_REDACTOR_ETAPA_2 = [
     {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-120b"},
-    {"activo": True, "proveedor": "GROQ",      "modelo": "qwen/qwen3-32b"},
     {"activo": True, "proveedor": "NVIDIA",    "modelo": "meta/llama-4-maverick-17b-128e-instruct"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "qwen/qwen3-32b"},
     {"activo": True, "proveedor": "GROQ",      "modelo": "meta-llama/llama-4-scout-17b-16e-instruct"},
-    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-sonnet-5-5"},
+    {"activo": True, "proveedor": "GROQ",      "modelo": "openai/gpt-oss-20b"},
     {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-haiku-5-5"},
+    {"activo": True, "proveedor": "ANTHROPIC", "modelo": "claude-sonnet-5-5"},
 ]
 
 HERRAMIENTAS_STACY = [
@@ -176,46 +186,186 @@ HERRAMIENTAS_STACY = [
 ]
 
 
-def _construir_cola_activa(numero_etapa: int) -> list[dict]:
+# =============================================================================
+# GESTOR DE CUOTAS EN VENTANA DESLIZANTE (60s) Y CIRCUIT BREAKER MULTI-CAUSA
+# =============================================================================
+def _obtener_estado_modelo(modelo: str) -> dict:
+    est = _ESTADO_MODELOS.get(modelo)
+    if est is None:
+        est = {
+            "eventos_tokens": [],  # lista de tuplas (timestamp, tokens)
+            "ultimo_uso_ts": 0.0,
+            "fallos_429_consecutivos": 0,
+        }
+        _ESTADO_MODELOS[modelo] = est
+    return est
+
+
+def _tokens_consumidos_ultimos_60s(modelo: str, ahora_ts: float) -> int:
+    est = _obtener_estado_modelo(modelo)
+    corte = ahora_ts - 60.0
+    est["eventos_tokens"] = [(ts, tok) for ts, tok in est["eventos_tokens"] if ts >= corte]
+    return sum(tok for _, tok in est["eventos_tokens"])
+
+
+def _registrar_exito_modelo(modelo: str, tokens_usados: int) -> None:
+    ahora_ts = time.time()
+    est = _obtener_estado_modelo(modelo)
+    est["ultimo_uso_ts"] = ahora_ts
+    est["fallos_429_consecutivos"] = 0
+    if tokens_usados > 0:
+        est["eventos_tokens"].append((ahora_ts, tokens_usados))
+    _CIRCUIT_BREAKER_429.pop(modelo, None)
+    _MOTIVO_BLOQUEO.pop(modelo, None)
+
+
+def _registrar_fallo_modelo(
+    modelo: str, error_str: str, retry_after: float | None = None
+) -> str:
+    """
+    Penaliza en el Circuit Breaker según el tipo de fallo y devuelve la etiqueta corta
+    del motivo ('429', '400', '5xx', 'Vacío', 'Timeout') para la telemetría.
+    """
+    ahora_ts = time.time()
+    est = _obtener_estado_modelo(modelo)
+    err_low = str(error_str or "").lower()
+
+    if "429" in err_low or "rate_limit" in err_low or "rate limit" in err_low:
+        est["fallos_429_consecutivos"] += 1
+        if retry_after and retry_after > 0:
+            enfriamiento = min(max(retry_after, 30.0), 600.0)
+        else:
+            enfriamiento = 60.0 * min(est["fallos_429_consecutivos"], 5)
+        _CIRCUIT_BREAKER_429[modelo] = ahora_ts + enfriamiento
+        _MOTIVO_BLOQUEO[modelo] = "429"
+        return "429"
+
+    if "400" in err_low and ("tool_use_failed" in err_low or "tool" in err_low):
+        _CIRCUIT_BREAKER_429[modelo] = ahora_ts + 30.0
+        _MOTIVO_BLOQUEO[modelo] = "400"
+        return "400"
+
+    if "vacía" in err_low or "vacia" in err_low or "sin texto" in err_low or "length" in err_low:
+        _CIRCUIT_BREAKER_429[modelo] = ahora_ts + 45.0
+        _MOTIVO_BLOQUEO[modelo] = "Vacío"
+        return "Vacío"
+
+    if any(k in err_low for k in ("timeout", "timed out", "connecterror", "500", "502", "503", "504")):
+        _CIRCUIT_BREAKER_429[modelo] = ahora_ts + 45.0
+        _MOTIVO_BLOQUEO[modelo] = "Timeout/5xx"
+        return "5xx"
+
+    _CIRCUIT_BREAKER_429[modelo] = ahora_ts + 25.0
+    _MOTIVO_BLOQUEO[modelo] = "Err"
+    return "Err"
+
+
+def _construir_cola_activa(
+    numero_etapa: int,
+    modelos_usados_consulta: set[str] | None = None,
+) -> list[dict]:
+    """
+    Construye la cola de proveedores activos y balancea dinámicamente los modelos
+    gratuitos para no repetir consecutivamente el mismo modelo ni saturar su TPM.
+    Los modelos de pago (Anthropic) permanecen siempre al final como último respaldo.
+    """
     keys = {
         "ANTHROPIC": settings.anthropic_api_key,
         "GROQ": settings.groq_api_key,
         "NVIDIA": settings.nvidia_api_key,
     }
     base = COLA_ENRUTADOR_ETAPA_1 if numero_etapa == 1 else COLA_REDACTOR_ETAPA_2
-    activos = []
-    for item in base:
+    usados = modelos_usados_consulta or set()
+    ahora_ts = time.time()
+
+    gratuitos: list[tuple[float, int, dict]] = []
+    pagos: list[dict] = []
+
+    for idx, item in enumerate(base):
         if not item.get("activo"):
             continue
         prov = item["proveedor"].upper()
         api_key = keys.get(prov)
         if not api_key:
             continue
+
+        modelo = item["modelo"]
         if prov == "ANTHROPIC":
-            activos.append({
+            pagos.append({
                 "nombre": "Anthropic",
                 "tipo": "ANTHROPIC",
                 "url": "https://api.anthropic.com/v1/messages",
                 "api_key": api_key,
-                "modelo": item["modelo"],
+                "modelo": modelo,
+                "es_pago": True,
             })
-        elif prov == "GROQ":
-            activos.append({
-                "nombre": "Groq",
-                "tipo": "OPENAI_COMPAT",
-                "url": "https://api.groq.com/openai/v1/chat/completions",
-                "api_key": api_key,
-                "modelo": item["modelo"],
-            })
-        elif prov == "NVIDIA":
-            activos.append({
-                "nombre": "NVIDIA",
-                "tipo": "OPENAI_COMPAT",
-                "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-                "api_key": api_key,
-                "modelo": item["modelo"],
-            })
-    return activos
+            continue
+
+        cfg = {
+            "nombre": "Groq" if prov == "GROQ" else "NVIDIA",
+            "tipo": "OPENAI_COMPAT",
+            "url": (
+                "https://api.groq.com/openai/v1/chat/completions"
+                if prov == "GROQ"
+                else "https://integrate.api.nvidia.com/v1/chat/completions"
+            ),
+            "api_key": api_key,
+            "modelo": modelo,
+            "es_pago": False,
+        }
+
+        # Cálculo de penalización de rotación para modelos gratuitos
+        est = _obtener_estado_modelo(modelo)
+        tok_60s = _tokens_consumidos_ultimos_60s(modelo, ahora_ts)
+        seg_desde_ultimo = ahora_ts - est["ultimo_uso_ts"]
+
+        penalizacion = 0.0
+        # 1. Evitar que el mismo modelo gratuito ejecute dos pasos seguidos en la misma consulta
+        if modelo in usados:
+            penalizacion += 100.0
+        # 2. Enfriamiento corto si acaba de ser invocado hace menos de 3.5 segundos
+        if seg_desde_ultimo < COOLDOWN_ENTRE_LLAMADAS_SEG:
+            penalizacion += 50.0
+        # 3. Enfriamiento preventivo por consumo elevado de tokens en los últimos 60s
+        if tok_60s >= UMBRAL_TOKENS_SUAVE_60S:
+            penalizacion += 80.0 + (tok_60s / 1000.0)
+        else:
+            penalizacion += (tok_60s / 2000.0)
+
+        gratuitos.append((penalizacion, idx, cfg))
+
+    gratuitos.sort(key=lambda x: (x[0], x[1]))
+    return [g[2] for g in gratuitos] + pagos
+
+
+def _resumir_datos_para_react(datos_recolectados: list[dict]) -> list[dict]:
+    """
+    Comprime los resultados de herramientas para las Rondas 2 y 3 del bucle ReAct (Etapa 1).
+    Conserva los KPIs, cabeceras y una muestra de 3 filas por tabla para ahorrar >75% de tokens.
+    """
+    resumenes = []
+    for item in datos_recolectados:
+        res_original = item.get("resultado_datos")
+        if not isinstance(res_original, dict):
+            resumenes.append(item)
+            continue
+
+        compacto: dict = {}
+        for k, v in res_original.items():
+            if isinstance(v, list) and len(v) > 4:
+                compacto[k] = {
+                    "total_elementos_obtenidos": len(v),
+                    "muestra_inicial": v[:3],
+                }
+            else:
+                compacto[k] = v
+
+        resumenes.append({
+            "herramienta": item.get("herramienta"),
+            "parametros": item.get("parametros"),
+            "resumen_resultado": compacto,
+        })
+    return resumenes
 
 
 def _calcular_costo_usd(modelo: str, usage: dict | None) -> float:
@@ -267,6 +417,7 @@ def _limpiar_formato_whatsapp(texto: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+
 async def _obtener_memoria_corto_plazo(sesion: AsyncSession, chat_id: str) -> str:
     if not chat_id:
         return ""
@@ -299,8 +450,8 @@ async def procesar_consulta_stacy(
     cliente: ClashClient,
 ) -> dict:
     """
-    Ejecuta el ciclo agéntico ReAct en Etapa 1 (hasta 3 iteraciones de herramientas)
-    y luego pasa todos los datos verificados a la Etapa 2 (Redactora S.T.A.C.Y.).
+    Ejecuta el ciclo agéntico ReAct en Etapa 1 rotando modelos entre rondas y
+    luego pasa los datos verificados a un modelo fresco en la Etapa 2 (Redactora).
     """
     t_inicio = time.monotonic()
 
@@ -344,9 +495,9 @@ async def procesar_consulta_stacy(
     memoria_chat = await _obtener_memoria_corto_plazo(sesion, chat_id)
     prompt_base = f"{memoria_chat}{ctx_remitente}Mensaje del usuario: \"{pregunta}\""
 
-    cola_e1 = _construir_cola_activa(1)
-    cola_e2 = _construir_cola_activa(2)
-    if not cola_e1 or not cola_e2:
+    cola_inicial_e1 = _construir_cola_activa(1)
+    cola_inicial_e2 = _construir_cola_activa(2)
+    if not cola_inicial_e1 or not cola_inicial_e2:
         return {
             "respuesta": "⚠️ *Error de Configuración:* Define al menos una API Key en las variables de entorno.",
             "nivel_acceso": nivel_acceso,
@@ -359,8 +510,9 @@ async def procesar_consulta_stacy(
             "latencia": 0.0,
         }
 
-    ahora_ts = time.time()
-    historial_saltos = []
+    historial_saltos: list[str] = []
+    modelos_usados_consulta: set[str] = set()
+    modelos_e1_nombres: list[str] = []
     modelo_e1 = "skip"
     tools_usadas: list[str] = []
     datos_recolectados: list[dict] = []
@@ -369,43 +521,53 @@ async def procesar_consulta_stacy(
     costo_total = 0.0
     iteraciones_e1 = 0
 
-    async with httpx.AsyncClient(timeout=28.0) as http_ia:
+    async with httpx.AsyncClient(timeout=25.0) as http_ia:
         # =====================================================================
-        # 🔹 ETAPA 1: BUCLE AGÉNTICO ReAct (Elige -> Ejecuta -> Verifica Suficiencia)
+        # 🔹 ETAPA 1: BUCLE AGÉNTICO ReAct CON ROTACIÓN DE MODELOS ENTRE RONDAS
         # =====================================================================
         for ronda in range(1, MAX_ITERACIONES_ETAPA_1 + 1):
             if ronda == 1:
                 prompt_iteracion = prompt_base
             else:
+                resumen_ligero = _resumir_datos_para_react(datos_recolectados)
                 prompt_iteracion = (
                     f"{prompt_base}\n\n"
-                    f"[RESULTADOS OBTENIDOS EN ITERACIÓN PREVIA ({len(datos_recolectados)} herramienta(s))]:\n"
-                    f"{json.dumps(datos_recolectados, ensure_ascii=False)}\n\n"
-                    "[VERIFICACIÓN DE SUFICIENCIA]: Analiza si los datos de arriba ya son suficientes para "
-                    "responder todos los puntos del mensaje del usuario. Si necesitas cruzar información con OTRA "
-                    "herramienta que aún no hayas ejecutado, llámala ahora. Si los datos ya están completos, "
-                    "NO llames ninguna herramienta y responde únicamente: DATOS_COMPLETOS"
+                    f"[RESUMEN DE HERRAMIENTAS YA EJECUTADAS ({len(datos_recolectados)} herramienta(s))]:\n"
+                    f"{json.dumps(resumen_ligero, ensure_ascii=False)}\n\n"
+                    "[VERIFICACIÓN DE SUFICIENCIA]: Los detalles completos de las tablas anteriores ya están "
+                    "listos para la Etapa 2. Si ya cubren todos los puntos del usuario, NO llames ninguna "
+                    "herramienta y responde únicamente: DATOS_COMPLETOS. Solo invoca otra herramienta si "
+                    "falta cruzar un dominio distinto."
                 )
 
             exito_ronda = False
             nuevas_tools_en_ronda = 0
+            cola_ronda_e1 = _construir_cola_activa(1, modelos_usados_consulta)
 
-            for prov1 in cola_e1:
+            for prov1 in cola_ronda_e1:
+                ahora_ts = time.time()
+                nombre_corto = prov1["modelo"].split("/")[-1]
                 if _CIRCUIT_BREAKER_429.get(prov1["modelo"], 0) > ahora_ts:
-                    historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}[429]")
+                    motivo = _MOTIVO_BLOQUEO.get(prov1["modelo"], "429")
+                    historial_saltos.append(f"E1:{nombre_corto}[{motivo}]")
                     continue
 
                 res1 = await _llamar_enrutador_etapa1(http_ia, prov1, prompt_iteracion)
                 if res1["exito"]:
                     exito_ronda = True
                     iteraciones_e1 = ronda
-                    modelo_e1 = prov1["modelo"].split("/")[-1]
+                    modelos_usados_consulta.add(prov1["modelo"])
+                    if nombre_corto not in modelos_e1_nombres:
+                        modelos_e1_nombres.append(nombre_corto)
+
                     u1 = res1.get("usage") or {}
-                    tokens_totales += sum(
+                    tok_ronda = sum(
                         int(u1.get(k) or 0)
                         for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
                     )
+                    tokens_totales += tok_ronda
                     costo_total += _calcular_costo_usd(prov1["modelo"], u1)
+                    _registrar_exito_modelo(prov1["modelo"], tok_ronda)
 
                     tool_calls = res1.get("tool_calls") or []
                     for tc in tool_calls:
@@ -413,7 +575,6 @@ async def procesar_consulta_stacy(
                         args_tool = dict(tc.get("args") or {})
                         firma = f"{nombre_fn}:{json.dumps(args_tool, sort_keys=True, ensure_ascii=False)}"
 
-                        # Evitar que re-ejecute exactamente la misma herramienta con los mismos argumentos
                         if firma in firmas_ejecutadas:
                             continue
                         firmas_ejecutadas.add(firma)
@@ -431,17 +592,21 @@ async def procesar_consulta_stacy(
                         })
                     break
 
-                err1 = str(res1.get("error") or "")
-                if "429" in err1:
-                    _CIRCUIT_BREAKER_429[prov1["modelo"]] = ahora_ts + 60.0
-                historial_saltos.append(f"E1:{prov1['modelo'].split('/')[-1]}")
+                etiqueta_err = _registrar_fallo_modelo(
+                    prov1["modelo"],
+                    str(res1.get("error") or ""),
+                    res1.get("retry_after"),
+                )
+                historial_saltos.append(f"E1:{nombre_corto}[{etiqueta_err}]")
 
-            # Si el modelo decidió que no necesita más herramientas, salimos del bucle ReAct
             if not exito_ronda or nuevas_tools_en_ronda == 0:
                 break
 
+        if modelos_e1_nombres:
+            modelo_e1 = "+".join(modelos_e1_nombres)[:50]
+
         # =====================================================================
-        # 🔹 ETAPA 2: CEREBRO REDACTOR DE S.T.A.C.Y.
+        # 🔹 ETAPA 2: CEREBRO REDACTOR DE S.T.A.C.Y. (CON MODELO FRESCO)
         # =====================================================================
         prompt_e2 = prompt_base
         if datos_recolectados:
@@ -458,20 +623,27 @@ async def procesar_consulta_stacy(
             )
 
         ultimo_err_e2 = ""
-        for prov2 in cola_e2:
+        cola_balanceada_e2 = _construir_cola_activa(2, modelos_usados_consulta)
+
+        for prov2 in cola_balanceada_e2:
+            ahora_ts = time.time()
+            nombre_corto2 = prov2["modelo"].split("/")[-1]
             if _CIRCUIT_BREAKER_429.get(prov2["modelo"], 0) > ahora_ts:
-                historial_saltos.append(f"E2:{prov2['modelo'].split('/')[-1]}[429]")
+                motivo = _MOTIVO_BLOQUEO.get(prov2["modelo"], "429")
+                historial_saltos.append(f"E2:{nombre_corto2}[{motivo}]")
                 continue
 
             res2 = await _llamar_redactor_etapa2(http_ia, prov2, prompt_e2)
             if res2["exito"] and res2.get("texto"):
-                modelo_e2 = prov2["modelo"].split("/")[-1]
+                modelo_e2 = nombre_corto2[:50]
                 u2 = res2.get("usage") or {}
-                tokens_totales += sum(
+                tok_e2 = sum(
                     int(u2.get(k) or 0)
                     for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
                 )
+                tokens_totales += tok_e2
                 costo_total += _calcular_costo_usd(prov2["modelo"], u2)
+                _registrar_exito_modelo(prov2["modelo"], tok_e2)
 
                 latencia = round(time.monotonic() - t_inicio, 1)
                 texto_final = _limpiar_formato_whatsapp(res2["texto"])
@@ -498,9 +670,12 @@ async def procesar_consulta_stacy(
                 }
 
             ultimo_err_e2 = str(res2.get("error") or "Error E2")
-            if "429" in ultimo_err_e2:
-                _CIRCUIT_BREAKER_429[prov2["modelo"]] = ahora_ts + 60.0
-            historial_saltos.append(f"E2:{prov2['modelo'].split('/')[-1]}")
+            etiqueta_err2 = _registrar_fallo_modelo(
+                prov2["modelo"],
+                ultimo_err_e2,
+                res2.get("retry_after"),
+            )
+            historial_saltos.append(f"E2:{nombre_corto2}[{etiqueta_err2}]")
 
     return {
         "respuesta": f"❌ *Error temporal en los motores de S.T.A.C.Y.:* {ultimo_err_e2}",
@@ -515,14 +690,26 @@ async def procesar_consulta_stacy(
     }
 
 
+def _extraer_retry_after(headers: httpx.Headers) -> float | None:
+    val = headers.get("retry-after")
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
 async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_entrada: str) -> dict:
     sys_prompt = construir_prompt_enrutador_etapa1()
+    modelo_low = prov["modelo"].lower()
+
     if prov["tipo"] == "ANTHROPIC":
         tools_cache = [dict(t) for t in HERRAMIENTAS_STACY]
         tools_cache[-1]["cache_control"] = {"type": "ephemeral"}
         payload: dict = {
             "model": prov["modelo"],
-            "max_tokens": 600,
+            "max_tokens": 1024,
             "system": [{"type": "text", "text": sys_prompt, "cache_control": {"type": "ephemeral"}}],
             "tools": tools_cache,
             "messages": [{"role": "user", "content": prompt_entrada}],
@@ -535,9 +722,14 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
                 prov["url"],
                 headers={"x-api-key": prov["api_key"], "anthropic-version": "2023-06-01"},
                 json=payload,
+                timeout=22.0,
             )
             if r.status_code != 200:
-                return {"exito": False, "error": f"HTTP {r.status_code}: {r.text[:140]}"}
+                return {
+                    "exito": False,
+                    "error": f"HTTP {r.status_code}: {r.text[:160]}",
+                    "retry_after": _extraer_retry_after(r.headers),
+                }
             data = r.json()
             t_calls = [
                 {"id": b["id"], "name": b["name"], "args": b.get("input") or {}}
@@ -546,29 +738,47 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
             ]
             return {"exito": True, "tool_calls": t_calls, "usage": data.get("usage")}
         except httpx.HTTPError as e:
-            return {"exito": False, "error": str(e)}
+            return {"exito": False, "error": f"Timeout/HTTP: {e}"}
+
+    # Desactivar pensamiento largo en Qwen3 para evitar gasto de tokens y errores tool_use_failed
+    prompt_usuario = f"{prompt_entrada}\n\n/no_think" if "qwen3" in modelo_low else prompt_entrada
 
     tools_oa = [
         {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
         for t in HERRAMIENTAS_STACY
     ]
+    payload_oa: dict = {
+        "model": prov["modelo"],
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt_usuario},
+        ],
+        "tools": tools_oa,
+        "tool_choice": "auto",
+        "temperature": 0.1,
+        "max_tokens": 1024,
+    }
+    if "gpt-oss" in modelo_low:
+        payload_oa["reasoning_effort"] = "low"
+
     try:
         r = await http.post(
             prov["url"],
             headers={"Authorization": f"Bearer {prov['api_key']}"},
-            json={
-                "model": prov["modelo"],
-                "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt_entrada}],
-                "tools": tools_oa,
-                "tool_choice": "auto",
-                "temperature": 0.1,
-                "max_tokens": 600,
-            },
+            json=payload_oa,
+            timeout=14.0,
         )
         if r.status_code != 200:
-            return {"exito": False, "error": f"HTTP {r.status_code}: {r.text[:140]}"}
+            return {
+                "exito": False,
+                "error": f"HTTP {r.status_code}: {r.text[:160]}",
+                "retry_after": _extraer_retry_after(r.headers),
+            }
         data = r.json()
-        msg = (data.get("choices") or [{}])[0].get("message") or {}
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        finish_reason = str(choice.get("finish_reason") or "")
+
         t_calls = []
         for tc in msg.get("tool_calls") or []:
             try:
@@ -576,6 +786,12 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
             except ValueError:
                 parsed = {}
             t_calls.append({"id": tc.get("id"), "name": tc["function"]["name"], "args": parsed})
+
+        # Si el modelo se cortó por longitud pensando y no devolvió ni tool_calls ni texto válido, fallar rápido
+        contenido_limpio = re.sub(r"<think>[\s\S]*?</think>", "", str(msg.get("content") or ""), flags=re.IGNORECASE).strip()
+        if not t_calls and finish_reason == "length" and not contenido_limpio:
+            return {"exito": False, "error": "Respuesta truncada por length en pensamiento E1"}
+
         u = data.get("usage") or {}
         return {
             "exito": True,
@@ -583,15 +799,17 @@ async def _llamar_enrutador_etapa1(http: httpx.AsyncClient, prov: dict, prompt_e
             "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)},
         }
     except httpx.HTTPError as e:
-        return {"exito": False, "error": str(e)}
+        return {"exito": False, "error": f"Timeout/HTTP: {e}"}
 
 
 async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_datos: str) -> dict:
     sys_prompt = construir_prompt_redactor_etapa2()
+    modelo_low = prov["modelo"].lower()
+
     if prov["tipo"] == "ANTHROPIC":
         payload: dict = {
             "model": prov["modelo"],
-            "max_tokens": 2048,
+            "max_tokens": 3000,
             "system": [{"type": "text", "text": sys_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": prompt_datos}],
         }
@@ -603,9 +821,14 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
                 prov["url"],
                 headers={"x-api-key": prov["api_key"], "anthropic-version": "2023-06-01"},
                 json=payload,
+                timeout=25.0,
             )
             if r.status_code != 200:
-                return {"exito": False, "error": f"HTTP {r.status_code}: {r.text[:140]}"}
+                return {
+                    "exito": False,
+                    "error": f"HTTP {r.status_code}: {r.text[:160]}",
+                    "retry_after": _extraer_retry_after(r.headers),
+                }
             data = r.json()
             texto = "\n".join(
                 b["text"] for b in data.get("content", []) if b.get("type") == "text" and b.get("text")
@@ -614,24 +837,43 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
                 return {"exito": False, "error": f"Sin texto ({data.get('stop_reason')})"}
             return {"exito": True, "texto": texto, "usage": data.get("usage")}
         except httpx.HTTPError as e:
-            return {"exito": False, "error": str(e)}
+            return {"exito": False, "error": f"Timeout/HTTP: {e}"}
+
+    # En Qwen3 desactivar el bloque <think> largo para dedicar todos los tokens a la respuesta
+    prompt_usuario = f"{prompt_datos}\n\n/no_think" if "qwen3" in modelo_low else prompt_datos
+
+    payload_oa: dict = {
+        "model": prov["modelo"],
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt_usuario},
+        ],
+        "temperature": 0.6,
+        "max_tokens": 3000,
+    }
+    if "gpt-oss" in modelo_low:
+        payload_oa["reasoning_effort"] = "low"
 
     try:
         r = await http.post(
             prov["url"],
             headers={"Authorization": f"Bearer {prov['api_key']}"},
-            json={
-                "model": prov["modelo"],
-                "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": prompt_datos}],
-                "temperature": 0.6,
-                "max_tokens": 2048,
-            },
+            json=payload_oa,
+            timeout=16.0,
         )
         if r.status_code != 200:
-            return {"exito": False, "error": f"HTTP {r.status_code}: {r.text[:140]}"}
+            return {
+                "exito": False,
+                "error": f"HTTP {r.status_code}: {r.text[:160]}",
+                "retry_after": _extraer_retry_after(r.headers),
+            }
         data = r.json()
         msg = (data.get("choices") or [{}])[0].get("message") or {}
-        texto = re.sub(r"<think>[\s\S]*?</think>", "", str(msg.get("content") or ""), flags=re.IGNORECASE).strip()
+        raw_content = str(msg.get("content") or "")
+        # Eliminar bloques <think> cerrados y también posibles bloques <think> truncados al final
+        texto = re.sub(r"<think>[\s\S]*?</think>", "", raw_content, flags=re.IGNORECASE)
+        texto = re.sub(r"<think>[\s\S]*$", "", texto, flags=re.IGNORECASE).strip()
+
         if not texto:
             return {"exito": False, "error": "Respuesta vacía en OpenAI-Compat E2"}
         u = data.get("usage") or {}
@@ -641,4 +883,4 @@ async def _llamar_redactor_etapa2(http: httpx.AsyncClient, prov: dict, prompt_da
             "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)},
         }
     except httpx.HTTPError as e:
-        return {"exito": False, "error": str(e)}
+        return {"exito": False, "error": f"Timeout/HTTP: {e}"}
