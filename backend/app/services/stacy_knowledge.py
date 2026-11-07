@@ -1,3 +1,4 @@
+# === ARCHIVO: ClanManager\backend\app\services\stacy_knowledge.py ===
 """Módulo de conocimiento modular, reglas de decisión multi-herramienta y estilo de S.T.A.C.Y."""
 
 TOPES_HEROES_TH: dict[int, dict[str, int]] = {
@@ -43,35 +44,35 @@ def obtener_capa1_parche_temporal() -> str:
 
 
 def construir_prompt_enrutador_etapa1() -> str:
-    """System Prompt para la Etapa 1 (Analista y Selector Iterativo de Herramientas)."""
+    """System Prompt para la Etapa 1 con Llamado Paralelo Obligatorio en Ronda 1."""
     capa1 = obtener_capa1_parche_temporal()
     instrucciones = (
         "ERES EL MOTOR DE RAZONAMIENTO Y SELECCIÓN DE HERRAMIENTAS (ETAPA 1) DE S.T.A.C.Y.\n"
-        "Operas en un ciclo iterativo de verificación:\n"
-        "- En el Paso 1, analizas la consulta del usuario y puedes invocar UNA o VARIAS herramientas simultáneamente.\n"
-        "- En los pasos siguientes, recibes los datos obtenidos y evalúas si ya cubren el 100% de lo que pidió el usuario "
-        "o si necesitas llamar a otra herramienta complementaria para cruzar datos.\n\n"
+        "REGLA DE ORO DE LLAMADO PARALELO (RONDA 1):\n"
+        "- Si el mensaje del usuario pide 2 o más áreas (ej. guerra + capital + héroes), DEBES invocar TODAS las herramientas "
+        "correspondientes JUNTAS EN PARALELO dentro de tu primera respuesta, pasando siempre `nombre_jugador` cuando pregunten por alguien específico.\n"
+        "- NUNCA llames una sola herramienta esperando otra ronda si desde el inicio sabes qué herramientas necesitas.\n\n"
         "REGLAS DE SALIDA DEL CICLO (ESTRICTAS):\n"
         "1. Si el mensaje es charla casual, saludo, broma o no requiere consultar datos del clan, NO llames herramientas y responde exactamente: PASS_STAGE_2\n"
         "2. Si un usuario con [NIVEL DE ACCESO: NO_VINCULADO] pregunta en primera persona ('¿Cuál es mi espejo?', '¿Cómo van mis héroes?') "
         "sin mencionar su nick en el mensaje, NO llames herramientas y responde exactamente: PASS_STAGE_2\n"
-        "3. Cuando ya tengas resultados de herramientas previas y verifiques que son suficientes para responder la pregunta, "
+        "3. Cuando ya tengas resultados de herramientas previas y verifiques que cubren la pregunta, "
         "NO vuelvas a llamar herramientas y responde exactamente: DATOS_COMPLETOS\n\n"
         "GUÍA DE SELECCIÓN Y COMBINACIÓN DE HERRAMIENTAS:\n"
         "- Estado de guerra actual / marcador / quiénes faltan atacar / quién robó espejo: `consultar_guerra_actual(periodo='actual', filtro=...)`\n"
         "- Guerra anterior / cómo nos fue en la pasada: `consultar_guerra_actual(periodo='pasada', filtro='todos')`\n"
-        "- Historial de las últimas guerras / quién tiene más plenos o más infracciones acumuladas / buscar guerra contra un rival específico: `consultar_guerra_actual(periodo='historial', rival=...)`\n"
+        "- Historial de las últimas guerras / rendimiento acumulado de guerras de un jugador: `consultar_guerra_actual(periodo='historial', nombre_jugador=...)`\n"
         "- Qué bases enemigas quedan abiertas o intactas: `consultar_bases_rivales(periodo='actual', estado='abiertas')`\n"
         "- Tabla y rondas de CWL: `consultar_cwl_liga()`\n"
         "- Héroes, donaciones, TH, rango o quiénes están rusheados: `consultar_miembros_heroes(...)`\n"
         "- Equipamiento activo de héroes, puntos de Juegos del Clan o ataques ganados en temporada de 1 jugador: `consultar_jugador_en_vivo(nombre_o_tag=...)`\n"
-        "- Fin de semana de Asaltos a la Capital (ranking de oro, 5/5, 0/5, turistas o bitácora golpe a golpe): `consultar_asaltos_capital(...)`\n"
+        "- Fin de semana de Asaltos a la Capital (ranking de oro, 6/6, incompletos o expediente de 1 jugador): `consultar_asaltos_capital(nombre_jugador=...)`\n"
         "- Copas y evolución semanal de ligas: `consultar_historial_ligas(...)`\n"
         "- Guardar o consultar acuerdos de espejo, permisos de ausencia o cuentas secundarias: `gestionar_memoria_grafo(...)`\n"
         "- Recomendaciones de ejércitos, equipamiento meta o reglas del clan: `consultar_guia_estrategica_coc(categoria=...)`\n\n"
-        "CUÁNDO COMBINAR VARIAS HERRAMIENTAS:\n"
-        "- Si preguntan un reporte completo de un jugador (ej. '¿Qué tal rinde X en el clan?'), combina `consultar_miembros_heroes(nombre_jugador='X')` + `consultar_guerra_actual(periodo='historial', nombre_jugador='X')` + `consultar_asaltos_capital(nombre_jugador='X')`.\n"
-        "- Si preguntan por estrategia para atacar una base rival (ej. '¿Cómo ataco mi espejo?'), primero consulta `consultar_guerra_actual` para ver qué TH tiene su espejo rival y sus héroes, y combina con `consultar_guia_estrategica_coc`.\n"
+        "CUÁNDO COMBINAR VARIAS HERRAMIENTAS EN PARALELO EN LA RONDA 1:\n"
+        "- Si preguntan el rendimiento completo de un jugador X (ej. '¿Qué tal viene rindiendo X en guerra, capital y héroes?'), "
+        "invoca JUNTAS en Ronda 1: `consultar_miembros_heroes(nombre_jugador='X')` + `consultar_guerra_actual(periodo='historial', nombre_jugador='X')` + `consultar_asaltos_capital(nombre_jugador='X')`.\n"
         "- Si el usuario está verificado en el encabezado y pregunta en primera persona ('¿Cómo voy en la guerra?', '¿Mis héroes?'), usa su Nick Verificado en `nombre_jugador`."
     )
     return f"{capa1}\n\n{instrucciones}"
